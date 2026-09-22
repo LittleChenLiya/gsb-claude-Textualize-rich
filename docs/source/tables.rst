@@ -166,6 +166,38 @@ For instance, the following code displays two pieces of text aligned to both the
     grid = Table.grid(expand=True)
     grid.add_column()
     grid.add_column(justify="right")
-    grid.add_row("Raising shields", "[bold magenta]COMPLETED [green]:heavy_check_mark:")
+   grid.add_row("Raising shields", "[bold magenta]COMPLETED [green]:heavy_check_mark:")
 
-    print(grid)
+   print(grid)
+
+Pagination
+~~~~~~~~~~
+
+Long tables may be split into pages that fit a terminal's height with
+:meth:`~rich.table.Table.paginate` (or the equivalent
+:meth:`~rich.console.Console.render_table_pages` helper)::
+
+    pages = table.paginate(console, width=80, page_height=24)
+    for page in pages:
+        console.print(page)
+
+Column widths are calculated once for the whole table, so every page uses
+the same alignment. The header (and the footer, if ``show_footer`` is
+enabled) is repeated on every page; the title, borders and footer all
+count towards ``page_height``. Rows that don't fit are moved to the next
+page. A single row taller than one page's content area is split at
+rendered terminal-line boundaries -- ANSI styles, hyperlinks and wide
+characters are never cut -- and the pages involved are marked with
+:attr:`~rich.table.TablePage.continued` and
+:attr:`~rich.table.TablePage.continues`. If ``page_height`` is too small
+to fit the repeated decorations plus a single row,
+:exc:`~rich.errors.PaginationError` is raised before any rendering.
+
+Cells are rendered at their final column width *before* pagination, which
+is how multi-line ``Text`` and nested renderables are supported. Note
+that this also applies to renderables whose height cannot be predicted
+without rendering them (for example, output that depends on the console
+or its options): they are rendered once, at the final width, and the
+resulting terminal lines are what gets paginated. Page height is derived
+from rendered lines only -- never from string lengths or slices of the
+source text -- so such objects paginate exactly as they render.

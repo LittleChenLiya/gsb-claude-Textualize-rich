@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from ._windows import WindowsConsoleFeatures
     from .live import Live
     from .status import Status
+    from .table import Table, TablePage
 
 JUPYTER_DEFAULT_COLUMNS = 115
 JUPYTER_DEFAULT_LINES = 100
@@ -1405,6 +1406,37 @@ class Console:
                     lines.extend(pad_line * extra_lines)
 
             return lines
+
+    def render_table_pages(
+        self,
+        table: "Table",
+        page_height: int,
+        width: Optional[int] = None,
+    ) -> List["TablePage"]:
+        """Render a table into a list of fixed-height pages.
+
+        This is a thin wrapper around :meth:`rich.table.Table.paginate`;
+        see that method for the pagination rules (repeated header/footer,
+        splitting of over-tall rows, and handling of renderables whose
+        height cannot be predicted).
+
+        Args:
+            table (Table): The table to paginate.
+            page_height (int): Height of one page in terminal lines.
+            width (Optional[int], optional): Width of the table in terminal
+                cells. Defaults to the console width.
+
+        Raises:
+            errors.PaginationError: If ``page_height`` is too small to fit
+                the repeated decorations plus a single content line.
+
+        Returns:
+            List[TablePage]: Pages that may be rendered independently,
+                e.g. with ``console.print(page)``.
+        """
+        return table.paginate(
+            self, self.width if width is None else width, page_height
+        )
 
     def render_str(
         self,

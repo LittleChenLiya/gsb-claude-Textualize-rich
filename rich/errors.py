@@ -22,6 +22,10 @@ class NotRenderableError(ConsoleError):
     """Object is not renderable."""
 
 
+class PaginationError(ConsoleError):
+    """A renderable could not be paginated with the requested page height."""
+
+
 class MarkupError(ConsoleError):
     """Markup was badly formatted."""
 
