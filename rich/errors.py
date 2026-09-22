@@ -32,3 +32,7 @@ class LiveError(ConsoleError):
 
 class NoAltScreen(ConsoleError):
     """Alt screen mode was required."""
+
+
+class PaginationError(ConsoleError):
+    """A renderable could not be paginated within the given constraints."""

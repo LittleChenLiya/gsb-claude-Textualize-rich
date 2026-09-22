@@ -169,3 +169,44 @@ For instance, the following code displays two pieces of text aligned to both the
     grid.add_row("Raising shields", "[bold magenta]COMPLETED [green]:heavy_check_mark:")
 
     print(grid)
+
+Pagination
+~~~~~~~~~~
+
+Long tables may be split into pages that fit within a terminal of a fixed
+height with :meth:~rich.table.Table.paginate, which accepts a width and
+a page_height (in terminal lines) and returns a list of
+rich.table.TablePage objects. Each page is an independent renderable
+that you may print or compose like any other Rich object::
+
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    table = Table(title="Movies")
+    table.add_column("Title")
+    # ... add rows ...
+
+    for page in table.paginate(console, width=32, page_height=12):
+        console.print(page)
+
+Column widths are calculated once for the whole table, so every page shares
+the same alignment. The header (with its borders) is repeated on every page,
+and the title, borders, footer, and a page number line all count towards
+page_height. Rows that don't fit on the current page are moved to the
+next page. If a single row is taller than the content area of a page, it is
+split at *rendered* terminal lines -- never inside a line -- so ANSI styles,
+hyperlinks, and wide (double width) characters are never cut in half, and the
+continuation is marked with a (continued) line.
+
+Cells may contain multi-line Text or any nested renderable. The height of
+such objects cannot be predicted before rendering, so Rich renders every row
+once at the final width and paginates based on the number of rendered lines.
+This means any renderable works in a paginated table, but its height is only
+known after it has been rendered; string length or string slicing is never
+used as a measure of screen columns.
+
+If page_height is too small to fit the header, footer, page number line,
+and at least one row, rich.table.Table.paginate raises
+rich.errors.PaginationError. An empty table still produces a valid
+single page.

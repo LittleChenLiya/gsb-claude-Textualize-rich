@@ -150,6 +150,54 @@ class _Cell(NamedTuple):
     """Cell vertical alignment."""
 
 
+class _GroupedLines(NamedTuple):
+    """A table rendered to lines, grouped by logical region."""
+
+    header: List[List["Segment"]]
+    """Lines repeated at the top of every page (top border, header, separator)."""
+    rows: List[List[List["Segment"]]]
+    """One list of lines per body row, including any trailing row separators."""
+    footer: List[List["Segment"]]
+    """Lines repeated at the bottom of every page (footer row, bottom border)."""
+
+
+class TablePage(JupyterMixin):
+    """A single page of a table split with :meth:`Table.paginate`.
+
+    Implements the Rich render protocol, so a page may be printed or composed
+    like any other renderable.
+    """
+
+    def __init__(
+        self,
+        lines: List[List["Segment"]],
+        page_number: int,
+        page_count: int,
+        width: int,
+    ) -> None:
+        self.lines = lines
+        """Rendered lines (lists of segments) that make up this page."""
+        self.page_number = page_number
+        """The 1-based number of this page."""
+        self.page_count = page_count
+        """The total number of pages."""
+        self.width = width
+        """The width of the page in terminal cells."""
+
+    def __rich_console__(
+        self, console: "Console", options: "ConsoleOptions"
+    ) -> "RenderResult":
+        new_line = Segment.line()
+        for line in self.lines:
+            yield from line
+            yield new_line
+
+    def __rich_measure__(
+        self, console: "Console", options: "ConsoleOptions"
+    ) -> Measurement:
+        return Measurement(self.width, self.width)
+
+
 class Table(JupyterMixin):
     """A console renderable to draw a table.
 
@@ -520,6 +568,179 @@ class Table(JupyterMixin):
                 justify=self.caption_justify,
             )
 
+    def paginate(
+        self,
+        console: "Console",
+        width: Optional[int] = None,
+        page_height: int = 25,
+    ) -> List[TablePage]:
+        """Split this table into pages that fit a terminal of a fixed height.
+
+        Column widths are calculated once for the whole table, so every page
+        shares the same alignment. The header (with borders) is repeated on
+        every page; the title, borders, footer, and a page number line all
+        count towards *page_height*. Rows that don't fit on the current page
+        are moved to the next page. A single row taller than the content area
+        of a page is split at *rendered* terminal lines (never inside a line),
+        so ANSI styles, hyperlinks, and wide characters are never cut in half;
+        continuation chunks are marked with a "(continued)" line.
+
+        Renderables whose height cannot be predicted (such as nested tables or
+        other arbitrary renderables) are rendered once at the final width and
+        measured afterwards; pagination is based on the number of rendered
+        lines, never on string length or slicing of strings.
+
+        Args:
+            console (Console): The console to render for.
+            width (int, optional): The width of the table in terminal cells.
+                Defaults to the table's ``width`` attribute, or the console width.
+            page_height (int): The maximum number of terminal lines per page.
+
+        Raises:
+            PaginationError: If *page_height* is too small to fit the header,
+                footer, page number line, and at least one content line.
+
+        Returns:
+            List[TablePage]: A list of independently renderable pages.
+        """
+        if not self.columns:
+            return [TablePage([[]], page_number=1, page_count=1, width=0)]
+
+        max_width = self.width if self.width is not None else width
+        if max_width is None:
+            max_width = console.options.max_width
+        extra_width = self._extra_width
+        widths = self._calculate_column_widths(
+            console, console.options.update_width(max_width - extra_width)
+        )
+        table_width = sum(widths) + extra_width
+        render_options = console.options.update(
+            width=table_width, highlight=self.highlight, height=None
+        )
+
+        def render_annotation_lines(
+            text: TextType, style: StyleType, justify: "JustifyMethod"
+        ) -> List[List[Segment]]:
+            render_text = (
+                console.render_str(text, style=style, highlight=False)
+                if isinstance(text, str)
+                else text
+            )
+            return console.render_lines(
+                render_text, options=render_options.update(justify=justify)
+            )
+
+        title_lines = (
+            render_annotation_lines(
+                self.title,
+                Style.pick_first(self.title_style, "table.title"),
+                self.title_justify,
+            )
+            if self.title
+            else []
+        )
+        caption_lines = (
+            render_annotation_lines(
+                self.caption,
+                Style.pick_first(self.caption_style, "table.caption"),
+                self.caption_justify,
+            )
+            if self.caption
+            else []
+        )
+
+        grouped = self._render_grouped(console, render_options, widths)
+
+        continuation_line = console.render_lines(
+            Text("\u2026 (continued)", style="dim"),
+            options=render_options.update(justify="center"),
+        )[0]
+
+        fixed_lines = len(grouped.header) + len(grouped.footer) + 1
+        capacity = page_height - fixed_lines
+        if capacity - len(title_lines) < 1:
+            raise errors.PaginationError(
+                f"page_height={page_height} is too small to paginate this table: "
+                f"the header, footer, and page number line require "
+                f"{fixed_lines + len(title_lines)} lines, "
+                "leaving no room for a single row"
+            )
+
+        groups: List[Tuple[List[List[Segment]], bool]] = []
+        if title_lines:
+            groups.append((title_lines, False))
+        groups.extend((row_lines, True) for row_lines in grouped.rows)
+        if caption_lines:
+            groups.append((caption_lines, False))
+
+        pages: List[List[List[Segment]]] = []
+        current: List[List[Segment]] = []
+
+        for lines, is_row in groups:
+            if not lines:
+                continue
+            if len(lines) <= capacity - len(current):
+                current.extend(lines)
+            elif len(lines) <= capacity:
+                if current:
+                    pages.append(current)
+                current = list(lines)
+            else:
+                # A single group (typically a row) taller than a whole page:
+                # split it at rendered terminal lines.
+                if is_row and capacity < 2:
+                    raise errors.PaginationError(
+                        f"page_height={page_height} is too small to split a row "
+                        "taller than one page (a continuation marker requires "
+                        "one additional line)"
+                    )
+                rest = lines
+                first_chunk = True
+                while rest:
+                    if first_chunk and current:
+                        room = capacity - len(current)
+                        marker: List[List[Segment]] = []
+                    else:
+                        if current:
+                            pages.append(current)
+                            current = []
+                        room = capacity if first_chunk else capacity - 1
+                        marker = [] if first_chunk else [continuation_line]
+                    if len(rest) <= room:
+                        current.extend(marker + rest)
+                        rest = []
+                    else:
+                        current.extend(marker + rest[:room])
+                        pages.append(current)
+                        current = []
+                        rest = rest[room:]
+                    first_chunk = False
+
+        if current or not pages:
+            pages.append(current)
+
+        page_count = len(pages)
+        table_pages: List[TablePage] = []
+        for page_number, content in enumerate(pages, 1):
+            page_number_line = console.render_lines(
+                Text(f"Page {page_number} of {page_count}", style="dim"),
+                options=render_options.update(justify="center"),
+            )[0]
+            table_pages.append(
+                TablePage(
+                    lines=[
+                        *grouped.header,
+                        *content,
+                        *grouped.footer,
+                        page_number_line,
+                    ],
+                    page_number=page_number,
+                    page_count=page_count,
+                    width=table_width,
+                )
+            )
+        return table_pages
+
     def _calculate_column_widths(
         self, console: "Console", options: "ConsoleOptions"
     ) -> List[int]:
@@ -755,6 +976,27 @@ class Table(JupyterMixin):
     def _render(
         self, console: "Console", options: "ConsoleOptions", widths: List[int]
     ) -> "RenderResult":
+        grouped = self._render_grouped(console, options, widths)
+        new_line = Segment.line()
+        for header_line in grouped.header:
+            yield from header_line
+            yield new_line
+        for row_lines in grouped.rows:
+            for row_line in row_lines:
+                yield from row_line
+                yield new_line
+        for footer_line in grouped.footer:
+            yield from footer_line
+            yield new_line
+
+    def _render_grouped(
+        self, console: "Console", options: "ConsoleOptions", widths: List[int]
+    ) -> _GroupedLines:
+        """Render the table to lines grouped by region (header, rows, footer).
+
+        Produces exactly the same output as :meth:`_render`, but retains the
+        structure required for pagination.
+        """
         table_style = console.get_style(self.style or "")
 
         border_style = table_style + console.get_style(self.border_style or "")
@@ -774,6 +1016,20 @@ class Table(JupyterMixin):
         _box = _box.get_plain_headed_box() if _box and not self.show_header else _box
 
         new_line = Segment.line()
+
+        header_lines: List[List[Segment]] = []
+        body_rows: List[List[List[Segment]]] = []
+        footer_lines: List[List[Segment]] = []
+        sink: List[List[Segment]] = header_lines
+        partial_line: List[Segment] = []
+
+        def emit(segment: Segment) -> None:
+            nonlocal partial_line
+            if segment is new_line:
+                sink.append(partial_line)
+                partial_line = []
+            else:
+                partial_line.append(segment)
 
         columns = self.columns
         show_header = self.show_header
@@ -802,8 +1058,8 @@ class Table(JupyterMixin):
                 ),
             ]
             if show_edge:
-                yield _Segment(_box.get_top(widths), border_style)
-                yield new_line
+                emit(_Segment(_box.get_top(widths), border_style))
+                emit(new_line)
         else:
             box_segments = []
 
@@ -813,6 +1069,8 @@ class Table(JupyterMixin):
         for index, (first, last, row_cell) in enumerate(loop_first_last(row_cells)):
             header_row = first and show_header
             footer_row = last and show_footer
+            row_lines: List[List[Segment]] = []
+            sink = row_lines
             row = (
                 self.rows[index - show_header]
                 if (not header_row and not footer_row)
@@ -878,10 +1136,12 @@ class Table(JupyterMixin):
 
             if _box:
                 if last and show_footer:
-                    yield _Segment(
-                        _box.get_row(widths, "foot", edge=show_edge), border_style
+                    emit(
+                        _Segment(
+                            _box.get_row(widths, "foot", edge=show_edge), border_style
+                        )
                     )
-                    yield new_line
+                    emit(new_line)
                 left, right, _divider = box_segments[0 if first else (2 if last else 1)]
 
                 # If the column divider is whitespace also style it with the row background
@@ -894,24 +1154,26 @@ class Table(JupyterMixin):
                 )
                 for line_no in range(max_height):
                     if show_edge:
-                        yield left
+                        emit(left)
                     for last_cell, rendered_cell in loop_last(cells):
-                        yield from rendered_cell[line_no]
+                        for cell_segment in rendered_cell[line_no]:
+                            emit(cell_segment)
                         if not last_cell:
-                            yield divider
+                            emit(divider)
                     if show_edge:
-                        yield right
-                    yield new_line
+                        emit(right)
+                    emit(new_line)
             else:
                 for line_no in range(max_height):
                     for rendered_cell in cells:
-                        yield from rendered_cell[line_no]
-                    yield new_line
+                        for cell_segment in rendered_cell[line_no]:
+                            emit(cell_segment)
+                    emit(new_line)
             if _box and first and show_header:
-                yield _Segment(
-                    _box.get_row(widths, "head", edge=show_edge), border_style
+                emit(
+                    _Segment(_box.get_row(widths, "head", edge=show_edge), border_style)
                 )
-                yield new_line
+                emit(new_line)
             end_section = row and row.end_section
             if _box and (show_lines or leading or end_section):
                 if (
@@ -920,19 +1182,34 @@ class Table(JupyterMixin):
                     and not (show_header and header_row)
                 ):
                     if leading:
-                        yield _Segment(
-                            _box.get_row(widths, "mid", edge=show_edge) * leading,
-                            border_style,
+                        emit(
+                            _Segment(
+                                _box.get_row(widths, "mid", edge=show_edge) * leading,
+                                border_style,
+                            )
                         )
                     else:
-                        yield _Segment(
-                            _box.get_row(widths, "row", edge=show_edge), border_style
+                        emit(
+                            _Segment(
+                                _box.get_row(widths, "row", edge=show_edge),
+                                border_style,
+                            )
                         )
-                    yield new_line
+                    emit(new_line)
 
+            if header_row:
+                header_lines.extend(row_lines)
+            elif footer_row:
+                footer_lines.extend(row_lines)
+            else:
+                body_rows.append(row_lines)
+
+        sink = footer_lines
         if _box and show_edge:
-            yield _Segment(_box.get_bottom(widths), border_style)
-            yield new_line
+            emit(_Segment(_box.get_bottom(widths), border_style))
+            emit(new_line)
+
+        return _GroupedLines(header_lines, body_rows, footer_lines)
 
 
 if __name__ == "__main__":  # pragma: no cover
