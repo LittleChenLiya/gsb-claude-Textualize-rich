@@ -119,6 +119,35 @@ By default, the progress information will refresh 10 times a second. You can set
 
 You might want to disable auto-refresh entirely if your updates are not very frequent, which you can do by setting ``auto_refresh=False`` on the constructor. If you disable auto-refresh you will need to call :meth:`~rich.progress.Progress.refresh` manually after updating your task(s).
 
+Checkpoints
+~~~~~~~~~~~
+
+You can save the state of every task in a Progress instance and restore it later -- even in another process -- with :meth:`~rich.progress.Progress.export_checkpoint` and :meth:`~rich.progress.Progress.restore_checkpoint`. The checkpoint is a versioned, JSON-compatible mapping containing each task's description, total, completed count, visibility, state (*running*, *paused* or *finished*), cumulative elapsed time, and any JSON-compatible fields. Threads, consoles, callbacks and absolute clock values are never stored.
+
+Here's an example::
+
+    import json
+    from rich.progress import Progress
+
+    progress = Progress()
+    task_id = progress.add_task("Downloading...", total=100)
+    progress.update(task_id, advance=40)
+
+    with open("checkpoint.json", "w") as file:
+        json.dump(progress.export_checkpoint(), file)
+
+Later (perhaps in another process), restore the tasks into a new Progress::
+
+    new_progress = Progress()
+    with open("checkpoint.json") as file:
+        id_map = new_progress.restore_checkpoint(json.load(file))
+
+:meth:`~rich.progress.Progress.restore_checkpoint` returns a mapping of the old task IDs to the new task IDs, and appends the restored tasks after any existing tasks. Timing is re-based on the new Progress instance's clock, so time spent while the process was stopped is not counted towards the elapsed time, and paused tasks remain paused. Restoring only restores task data; it does not start the Live display or redirect output. The whole checkpoint is validated before anything is restored: if it is invalid a :class:`~rich.progress.ProgressCheckpointError` is raised (with the path of the offending value) and the target Progress is left unchanged.
+
+To see a checkpoint round trip in action, run the following from the repository root (it takes a few seconds)::
+
+    python examples/progress_checkpoint.py
+
 
 Expand
 ~~~~~~

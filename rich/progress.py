@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import io
+import math
 import typing
 import warnings
 from abc import ABC, abstractmethod
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import timedelta
 from io import RawIOBase, UnsupportedOperation
@@ -26,6 +28,7 @@ from typing import (
     Iterable,
     List,
     Literal,
+    Mapping,
     NamedTuple,
     NewType,
     Optional,
@@ -56,6 +59,152 @@ TaskID = NewType("TaskID", int)
 ProgressType = TypeVar("ProgressType")
 
 GetTimeCallable = Callable[[], float]
+
+CHECKPOINT_VERSION = 1
+"""Version of the progress checkpoint format."""
+
+_TASK_STATES = ("running", "paused", "finished")
+
+
+class ProgressCheckpointError(ValueError):
+    """Raised when a progress checkpoint is invalid and cannot be restored."""
+
+    def __init__(self, path: str, message: str) -> None:
+        self.path = path
+        """Path to the offending value within the checkpoint, e.g. tasks[1].completed"""
+        super().__init__(f"invalid checkpoint at {path}: {message}")
+
+
+def _validate_checkpoint_number(
+    value: Any, path: str, *, allow_none: bool = False
+) -> Optional[float]:
+    """Validate a JSON number from a checkpoint, rejecting NaN and infinity."""
+    if value is None:
+        if allow_none:
+            return None
+        raise ProgressCheckpointError(path, "expected a number, got None")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProgressCheckpointError(
+            path, f"expected a number, got {type(value).__name__}"
+        )
+    if not math.isfinite(value):
+        raise ProgressCheckpointError(
+            path, "expected a finite number, got NaN or infinity"
+        )
+    return float(value)
+
+
+def _validate_checkpoint_json_value(value: Any, path: str) -> None:
+    """Validate that a value is composed of JSON-compatible types only."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ProgressCheckpointError(
+                path, "expected a finite number, got NaN or infinity"
+            )
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_checkpoint_json_value(item, f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProgressCheckpointError(
+                    path, f"expected string keys, got {type(key).__name__}"
+                )
+            _validate_checkpoint_json_value(item, f"{path}.{key}")
+        return
+    raise ProgressCheckpointError(
+        path, f"value of type {type(value).__name__} is not JSON compatible"
+    )
+
+
+def _validate_checkpoint(checkpoint: Any) -> List[Dict[str, Any]]:
+    """Validate a checkpoint in full, returning a list of normalized task specs.
+
+    Raises:
+        ProgressCheckpointError: If any part of the checkpoint is invalid. No task
+            specs are returned in that case, so nothing should be restored.
+    """
+    if not isinstance(checkpoint, Mapping):
+        raise ProgressCheckpointError(
+            "$", f"expected a mapping, got {type(checkpoint).__name__}"
+        )
+    version = checkpoint.get("version")
+    if version != CHECKPOINT_VERSION:
+        raise ProgressCheckpointError(
+            "version", f"unsupported checkpoint version {version!r}"
+        )
+    tasks = checkpoint.get("tasks")
+    if not isinstance(tasks, list):
+        raise ProgressCheckpointError(
+            "tasks", f"expected a list, got {type(tasks).__name__}"
+        )
+    seen_ids = set()
+    validated: List[Dict[str, Any]] = []
+    for index, entry in enumerate(tasks):
+        path = f"tasks[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ProgressCheckpointError(
+                path, f"expected a mapping, got {type(entry).__name__}"
+            )
+        old_id = entry.get("id")
+        if isinstance(old_id, bool) or not isinstance(old_id, int):
+            raise ProgressCheckpointError(
+                f"{path}.id", f"expected an integer, got {type(old_id).__name__}"
+            )
+        if old_id in seen_ids:
+            raise ProgressCheckpointError(f"{path}.id", f"duplicate task id {old_id}")
+        seen_ids.add(old_id)
+        description = entry.get("description")
+        if not isinstance(description, str):
+            raise ProgressCheckpointError(
+                f"{path}.description",
+                f"expected a string, got {type(description).__name__}",
+            )
+        total = _validate_checkpoint_number(
+            entry.get("total"), f"{path}.total", allow_none=True
+        )
+        completed = _validate_checkpoint_number(
+            entry.get("completed"), f"{path}.completed"
+        )
+        visible = entry.get("visible")
+        if not isinstance(visible, bool):
+            raise ProgressCheckpointError(
+                f"{path}.visible", f"expected a bool, got {type(visible).__name__}"
+            )
+        state = entry.get("state")
+        if state not in _TASK_STATES:
+            raise ProgressCheckpointError(
+                f"{path}.state", f"expected one of {_TASK_STATES}, got {state!r}"
+            )
+        elapsed = _validate_checkpoint_number(entry.get("elapsed"), f"{path}.elapsed")
+        assert elapsed is not None
+        if elapsed < 0:
+            raise ProgressCheckpointError(
+                f"{path}.elapsed", "elapsed must not be negative"
+            )
+        fields = entry.get("fields", {})
+        if not isinstance(fields, Mapping):
+            raise ProgressCheckpointError(
+                f"{path}.fields", f"expected a mapping, got {type(fields).__name__}"
+            )
+        _validate_checkpoint_json_value(fields, f"{path}.fields")
+        validated.append(
+            {
+                "id": old_id,
+                "description": description,
+                "total": total,
+                "completed": completed,
+                "visible": visible,
+                "state": state,
+                "elapsed": elapsed,
+                "fields": fields,
+            }
+        )
+    return validated
 
 
 _I = typing.TypeVar("_I", TextIO, BinaryIO)
@@ -1649,6 +1798,99 @@ class Progress(JupyterMixin):
         """
         with self._lock:
             del self._tasks[task_id]
+
+    def export_checkpoint(self) -> Dict[str, Any]:
+        """Export a versioned, JSON-compatible checkpoint of all tasks.
+
+        The checkpoint captures a consistent snapshot of every task (taken
+        atomically under the progress lock): its description, total, completed
+        count, visibility, state ("running", "paused" or "finished"),
+        cumulative elapsed time, and any JSON-compatible fields. Threads,
+        consoles, callbacks, absolute clock values, and speed samples are not
+        included.
+
+        The returned mapping may be serialized with the json module and later
+        restored with restore_checkpoint.
+
+        Returns:
+            Dict[str, Any]: A JSON-compatible checkpoint mapping.
+        """
+        with self._lock:
+            tasks = []
+            for task in self._tasks.values():
+                if task.finished_time is not None:
+                    state = "finished"
+                    elapsed = task.finished_time
+                elif task.stop_time is not None or task.start_time is None:
+                    state = "paused"
+                    elapsed = task.elapsed
+                else:
+                    state = "running"
+                    elapsed = task.elapsed
+                tasks.append(
+                    {
+                        "id": int(task.id),
+                        "description": task.description,
+                        "total": task.total,
+                        "completed": task.completed,
+                        "visible": task.visible,
+                        "state": state,
+                        "elapsed": 0.0 if elapsed is None else elapsed,
+                        "fields": deepcopy(task.fields),
+                    }
+                )
+            return {"version": CHECKPOINT_VERSION, "tasks": tasks}
+
+    def restore_checkpoint(self, checkpoint: Dict[str, Any]) -> Dict[TaskID, TaskID]:
+        """Restore tasks from a checkpoint created by export_checkpoint.
+
+        The checkpoint is validated in full before anything is restored; if any
+        task is invalid a ProgressCheckpointError is raised and this
+        Progress instance is left unchanged. Restored tasks are appended after
+        any existing tasks. Timing is re-based on this instance's get_time
+        clock, so time spent while the process was stopped is not counted, and
+        speed samples are discarded (speed is estimated again from new samples).
+        Restoring only restores task data; it does not start the Live display
+        or redirect output.
+
+        Args:
+            checkpoint (Dict[str, Any]): A checkpoint mapping, e.g. decoded from JSON.
+
+        Raises:
+            ProgressCheckpointError: If the checkpoint is invalid.
+
+        Returns:
+            Dict[TaskID, TaskID]: A mapping of old task IDs to new task IDs.
+        """
+        task_specs = _validate_checkpoint(checkpoint)
+        with self._lock:
+            current_time = self.get_time()
+            id_map: Dict[TaskID, TaskID] = {}
+            for spec in task_specs:
+                new_task_id = self._task_index
+                task = Task(
+                    new_task_id,
+                    spec["description"],
+                    spec["total"],
+                    spec["completed"],
+                    visible=spec["visible"],
+                    fields=deepcopy(spec["fields"]),
+                    _get_time=self.get_time,
+                    _lock=self._lock,
+                )
+                elapsed = spec["elapsed"]
+                task.start_time = current_time - elapsed
+                if spec["state"] == "running":
+                    task.stop_time = None
+                else:
+                    task.stop_time = current_time
+                    if spec["state"] == "finished":
+                        task.finished_time = elapsed
+                self._tasks[new_task_id] = task
+                id_map[TaskID(spec["id"])] = new_task_id
+                self._task_index = TaskID(int(self._task_index) + 1)
+        self.refresh()
+        return id_map
 
 
 if __name__ == "__main__":  # pragma: no coverage
