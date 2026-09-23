@@ -292,6 +292,36 @@ Multiple Progress
 
 You can't have different columns per task with a single Progress instance. However, you can have as many Progress instances as you like in a :ref:`live`. See `live_progress.py <https://github.com/willmcgugan/rich/blob/master/examples/live_progress.py>`_ and `dynamic_progress.py <https://github.com/willmcgugan/rich/blob/master/examples/dynamic_progress.py>`_ for examples of using multiple Progress instances.
 
+
+Checkpoints
+-----------
+
+A Progress display can be saved to a versioned, JSON-serializable *checkpoint* and restored later, for example to resume a long-running job after a restart. Call :meth:`~rich.progress.Progress.export_checkpoint` to snapshot every task (description, total, completed, visibility, pending/running/paused/finished state, cumulative elapsed seconds, and any JSON-compatible custom fields), and :meth:`~rich.progress.Progress.restore_checkpoint` to append those tasks to another Progress instance. Restoring returns a mapping of the old task ids to the newly allocated ones::
+
+    import json
+    from rich.progress import Progress
+
+    progress = Progress()
+    task_id = progress.add_task("Processing", total=100)
+    # ... work happens here ...
+
+    with open("checkpoint.json", "w") as file:
+        json.dump(progress.export_checkpoint(), file)
+
+    # Later, possibly in another process:
+    with open("checkpoint.json") as file:
+        checkpoint = json.load(file)
+    resumed = Progress()
+    id_map = resumed.restore_checkpoint(checkpoint)
+
+Only task data is saved: threads, the console, callbacks and absolute clock readings are never part of a checkpoint. Time is re-based on the target Progress when restoring, so the time spent stopped does not count towards a task's elapsed time, and paused tasks remain paused. Previously recorded speed samples are discarded, so speed is estimated from fresh samples only. Restoring never starts the Live display or redirects output.
+
+The whole checkpoint is validated before anything is added. An unsupported version, NaN values, duplicate task ids, negative elapsed times or non-JSON-compatible fields raise a :class:`ValueError` that names the offending path (such as ``tasks[1].completed``), and the target Progress is left unchanged.
+
+For a runnable demonstration (which uses a controllable clock, so it completes in a few seconds), run::
+
+    python examples/progress_checkpoint.py
+
 Example
 -------
 
