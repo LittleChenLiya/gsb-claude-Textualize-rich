@@ -1,5 +1,7 @@
+import io
 from dataclasses import dataclass, field, replace
 from typing import (
+    Any,
     TYPE_CHECKING,
     Dict,
     Iterable,
@@ -16,6 +18,7 @@ from ._loop import loop_first_last, loop_last
 from ._pick import pick_bool
 from ._ratio import ratio_distribute, ratio_reduce
 from .align import VerticalAlignMethod
+from .control import strip_control_codes
 from .jupyter import JupyterMixin
 from .measure import Measurement
 from .padding import Padding, PaddingDimensions
@@ -148,6 +151,15 @@ class _Cell(NamedTuple):
     """Cell renderable."""
     vertical: VerticalAlignMethod
     """Cell vertical alignment."""
+
+
+# Width used when rendering cells for export, so that exported text is never
+# wrapped or truncated to fit a terminal width.
+_EXPORT_WIDTH = 1_000_000
+
+
+class TableExportError(ValueError):
+    """Raised when a table can not be exported, e.g. a cell exceeds the maximum length."""
 
 
 class Table(JupyterMixin):
@@ -471,6 +483,95 @@ class Table(JupyterMixin):
 
         if self.rows:
             self.rows[-1].end_section = True
+
+    def export(
+        self,
+        *,
+        console: Optional["Console"] = None,
+        max_cell_length: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Export the table contents as structured, JSON-serializable data.
+
+        Cells are rendered with the console protocol (so any renderable may be
+        exported), but the result contains plain text only: no styles, no
+        control characters, and no wrapping or truncation to fit a terminal
+        width. Multi-line cell content is preserved with newlines. Each cell
+        is rendered exactly once per export.
+
+        exported), but the result contains plain text only: no styles, no
+        control characters, and no wrapping or truncation to fit a terminal
+        width. Multi-line cell content is preserved with newlines. Each cell
+        is rendered exactly once per export.
+
+        Objects that do not support the console protocol (such as numbers)
+        are converted with ``str()``, mirroring :meth:`~rich.console.Console.print`.
+
+        Args:
+            console (Console, optional): Console used to render the cells, or
+                None to create an internal console. Defaults to None.
+            max_cell_length (int, optional): Maximum number of characters
+                allowed in an exported cell, or None for no limit. If a cell
+                exceeds the limit a :class:`TableExportError` is raised and no
+                data is returned. Defaults to None.
+
+        Raises:
+            TableExportError: If a cell contains more than ``max_cell_length``
+                characters.
+
+        Returns:
+            Dict[str, Any]: A dict with a "columns" list (column index and
+                name) and a "rows" list (row index and a mapping of column
+                index to cell text). Cells are keyed by column index so that
+                duplicate column names remain distinguishable.
+        """
+        from .console import Console
+
+        if console is None:
+            console = Console(file=io.StringIO(), force_terminal=False)
+        options = console.options.update(
+            min_width=1,
+            max_width=_EXPORT_WIDTH,
+            height=None,
+        )
+
+        def render_cell_text(renderable: "RenderableType") -> str:
+            if not is_renderable(renderable):
+                renderable = str(renderable)
+            segments = console.render(renderable, options)
+            text = strip_control_codes(
+                "".join(segment.text for segment in segments if not segment.control)
+            )
+            lines = text.split("\n")
+            while lines and not lines[-1]:
+                lines.pop()
+            return "\n".join(lines)
+
+        columns_data = [
+            {"index": column_index, "name": render_cell_text(column.header)}
+            for column_index, column in enumerate(self.columns)
+        ]
+
+        rows_data = []
+        for row_index in range(len(self.rows)):
+            cells: Dict[str, str] = {}
+            for column_index, column in enumerate(self.columns):
+                column_cells = column._cells
+                cell_text = (
+                    render_cell_text(column_cells[row_index])
+                    if row_index < len(column_cells)
+                    else ""
+                )
+                if max_cell_length is not None and len(cell_text) > max_cell_length:
+                    raise TableExportError(
+                        f"cell at row {row_index}, column {column_index} "
+                        f"({columns_data[column_index]['name']!r}) contains "
+                        f"{len(cell_text)} characters, which exceeds the maximum "
+                        f"of {max_cell_length}"
+                    )
+                cells[str(column_index)] = cell_text
+            rows_data.append({"index": row_index, "cells": cells})
+
+        return {"columns": columns_data, "rows": rows_data}
 
     def __rich_console__(
         self, console: "Console", options: "ConsoleOptions"
