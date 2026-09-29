@@ -7,6 +7,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -129,6 +130,40 @@ class Column:
 
 
 @dataclass
+class ColumnGroup:
+    """Defines a named group of consecutive leaf columns in a ~Table.
+
+    A group renders its title in an additional header row, spanning the
+    leaf columns it covers. Groups may contain nested sub-groups via
+    ``children`` to build multi-level grouped headers.
+
+    Args:
+        title (RenderableType, optional): Title rendered across the covered columns. Defaults to "".
+        columns (List[int], optional): Indices of leaf columns covered directly by this group. Defaults to None.
+        children (List[ColumnGroup], optional): Nested sub-groups. Their covered columns are
+            also covered by this group. Defaults to None.
+        style (Union[str, Style], optional): Style of the group title, applied on top of the
+            table header style. Defaults to "".
+        justify (str, optional): Justify method for the group title. Defaults to "center".
+    """
+
+    title: "RenderableType" = ""
+    """RenderableType: Title rendered across the covered columns."""
+
+    columns: Optional[List[int]] = None
+    """Optional[List[int]]: Indices of leaf columns covered directly by this group."""
+
+    children: Optional[List["ColumnGroup"]] = None
+    """Optional[List[ColumnGroup]]: Nested sub-groups within this group."""
+
+    style: StyleType = ""
+    """StyleType: Style of the group title."""
+
+    justify: "JustifyMethod" = "center"
+    """str: How to justify the group title within its span."""
+
+
+@dataclass
 class Row:
     """Information regarding a row."""
 
@@ -248,6 +283,7 @@ class Table(JupyterMixin):
             else:
                 header._index = len(self.columns)
                 append_column(header)
+        self.column_groups: List[ColumnGroup] = []
 
     @classmethod
     def grid(
@@ -341,11 +377,27 @@ class Table(JupyterMixin):
         minimum_width = (
             sum(measurement.minimum for measurement in measurements) + extra_width
         )
+        if self.column_groups:
+            divider_width = 1 if self.box else 0
+            for _, group, start, end in self._resolve_group_spans():
+                title_minimum = Measurement.get(console, options, group.title).minimum
+                span_minimum = (
+                    sum(
+                        column_measurement.minimum
+                        for column_measurement in measurements[start : end + 1]
+                    )
+                    + (end - start) * divider_width
+                )
+                minimum_width = max(
+                    minimum_width, minimum_width - span_minimum + title_minimum
+                )
         maximum_width = (
             sum(measurement.maximum for measurement in measurements) + extra_width
             if (self.width is None)
             else self.width
         )
+        if self.column_groups:
+            maximum_width = max(maximum_width, minimum_width)
         measurement = Measurement(minimum_width, maximum_width)
         measurement = measurement.clamp(self.min_width)
         return measurement
@@ -419,6 +471,152 @@ class Table(JupyterMixin):
         )
         self.columns.append(column)
 
+    def add_column_group(
+        self,
+        title: "RenderableType" = "",
+        *,
+        columns: Optional[Iterable[int]] = None,
+        children: Optional[Iterable[ColumnGroup]] = None,
+        style: Optional[StyleType] = None,
+        justify: "JustifyMethod" = "center",
+    ) -> ColumnGroup:
+        """Add a group header spanning consecutive leaf columns.
+
+        The group title is rendered in an additional header row above the column
+        headers, spanning the covered columns. Groups may be nested by passing
+        :class:`~rich.table.ColumnGroup` instances as ``children``.
+
+        Args:
+            title (RenderableType, optional): Title rendered across the covered columns.
+            columns (Iterable[int], optional): Indices of leaf columns covered directly
+                by this group. Defaults to None.
+            children (Iterable[ColumnGroup], optional): Nested sub-groups. Defaults to None.
+            style (Union[str, Style], optional): Style for the group title, or None for
+                the default header style. Defaults to None.
+            justify (JustifyMethod, optional): Alignment of the group title within its
+                span. Defaults to "center".
+
+        Returns:
+            ColumnGroup: The added column group.
+
+        Raises:
+            errors.ColumnGroupError: If the group (or a nested group) is empty, covers
+                non-consecutive columns, overlaps a sibling group, or references a
+                column index out of range. Raised when the table is measured or rendered.
+        """
+        group = ColumnGroup(
+            title=title,
+            columns=list(columns) if columns is not None else None,
+            children=list(children) if children is not None else None,
+            style=style or "",
+            justify=justify,
+        )
+        self.column_groups.append(group)
+        return group
+
+    def _resolve_group_spans(self) -> List[Tuple[int, "ColumnGroup", int, int]]:
+        """Validate column groups and resolve them to leaf column spans.
+
+        Returns:
+            List[Tuple[int, ColumnGroup, int, int]]: A list of
+                ``(depth, group, start, end)`` tuples, where ``start`` and ``end`` are
+                the first and last leaf column indices covered by the group.
+
+        Raises:
+            errors.ColumnGroupError: If a group is empty, spans non-consecutive
+                columns, overlaps another group at the same level, or references
+                a column index that is out of range.
+        """
+        column_count = len(self.columns)
+        spans: List[Tuple[int, ColumnGroup, int, int]] = []
+
+        def check_indices(indices: List[int], group: ColumnGroup) -> None:
+            for index in indices:
+                if not isinstance(index, int) or index < 0 or index >= column_count:
+                    raise errors.ColumnGroupError(
+                        f"column group {group.title!r} references column index "
+                        f"{index!r}, which is out of range for {column_count} column(s)"
+                    )
+            if len(set(indices)) != len(indices):
+                raise errors.ColumnGroupError(
+                    f"column group {group.title!r} lists a column more than once"
+                )
+
+        def resolve(group: ColumnGroup, depth: int) -> Tuple[int, int]:
+            own_columns = list(group.columns or [])
+            check_indices(own_columns, group)
+            child_spans = [
+                resolve(child, depth + 1) for child in (group.children or [])
+            ]
+            covered = set(own_columns)
+            for child_start, child_end in child_spans:
+                child_columns = set(range(child_start, child_end + 1))
+                overlap = covered & child_columns
+                if overlap:
+                    raise errors.ColumnGroupError(
+                        f"column group {group.title!r} covers column(s) "
+                        f"{sorted(overlap)} more than once"
+                    )
+                covered |= child_columns
+            if not covered:
+                raise errors.ColumnGroupError(
+                    f"column group {group.title!r} covers no columns"
+                )
+            start, end = min(covered), max(covered)
+            if len(covered) != end - start + 1:
+                raise errors.ColumnGroupError(
+                    f"column group {group.title!r} must cover consecutive columns; "
+                    f"got {sorted(covered)}",
+                )
+            spans.append((depth, group, start, end))
+            return start, end
+
+        top_level: List[Tuple[int, int]] = []
+        for group in self.column_groups:
+            top_level.append(resolve(group, 0))
+        covered_columns: Set[int] = set()
+        for start, end in top_level:
+            overlap = covered_columns & set(range(start, end + 1))
+            if overlap:
+                raise errors.ColumnGroupError(
+                    f"column(s) {sorted(overlap)} are covered by more than one "
+                    "top-level column group",
+                )
+            covered_columns |= set(range(start, end + 1))
+        return spans
+
+    def _group_levels(
+        self, spans: List[Tuple[int, "ColumnGroup", int, int]]
+    ) -> List[List[Tuple[Optional[ColumnGroup], int, int]]]:
+        """Arrange resolved group spans into header rows (one per nesting level).
+
+        Each level tiles the full width of the table with group spans; columns not
+        covered by a group at that level appear as individual blank cells.
+        """
+        column_count = len(self.columns)
+        if not spans:
+            return []
+        max_depth = max(depth for depth, _, _, _ in spans)
+        levels: List[List[Tuple[Optional[ColumnGroup], int, int]]] = []
+        for depth in range(max_depth + 1):
+            level_spans = sorted(
+                (span for span in spans if span[0] == depth),
+                key=lambda span: span[2],
+            )
+            cells: List[Tuple[Optional[ColumnGroup], int, int]] = []
+            column_index = 0
+            for _, group, start, end in level_spans:
+                while column_index < start:
+                    cells.append((None, column_index, column_index))
+                    column_index += 1
+                cells.append((group, start, end))
+                column_index = end + 1
+            while column_index < column_count:
+                cells.append((None, column_index, column_index))
+                column_index += 1
+            levels.append(cells)
+        return levels
+
     def add_row(
         self,
         *renderables: Optional["RenderableType"],
@@ -478,6 +676,10 @@ class Table(JupyterMixin):
         if not self.columns:
             yield Segment("\n")
             return
+
+        if self.column_groups:
+            # Validate groups before anything is rendered.
+            self._resolve_group_spans()
 
         max_width = options.max_width
         if self.width is not None:
@@ -582,6 +784,34 @@ class Table(JupyterMixin):
             )
             pad_widths = ratio_distribute(_max_width - table_width, widths)
             widths = [_width + pad for _width, pad in zip(widths, pad_widths)]
+
+        if self.column_groups:
+            # Grow leaf columns (if there is room) so that group titles fit
+            # within the span of the columns they cover.
+            divider_width = 1 if self.box else 0
+            room = max_width - sum(widths)
+            if room > 0:
+                group_spans = sorted(
+                    self._resolve_group_spans(), key=lambda span: -span[0]
+                )
+                for _, group, start, end in group_spans:
+                    if room <= 0:
+                        break
+                    span_width = sum(widths[start : end + 1]) + (end - start) * (
+                        divider_width
+                    )
+                    title_minimum = Measurement.get(
+                        console, options, group.title
+                    ).minimum
+                    grow = min(title_minimum - span_width, room)
+                    if grow > 0:
+                        count = end - start + 1
+                        share, remainder = divmod(grow, count)
+                        for index in range(start, end + 1):
+                            widths[index] += share
+                        for index in range(start, start + remainder):
+                            widths[index] += 1
+                        room -= grow
 
         return widths
 
@@ -807,6 +1037,11 @@ class Table(JupyterMixin):
         else:
             box_segments = []
 
+        if show_header and self.column_groups:
+            yield from self._render_group_rows(
+                console, options, widths, _box, border_style, show_edge
+            )
+
         get_row_style = self.get_row_style
         get_style = console.get_style
 
@@ -933,6 +1168,90 @@ class Table(JupyterMixin):
         if _box and show_edge:
             yield _Segment(_box.get_bottom(widths), border_style)
             yield new_line
+
+    def _render_group_rows(
+        self,
+        console: "Console",
+        options: "ConsoleOptions",
+        widths: List[int],
+        _box: Optional["box.Box"],
+        border_style: Style,
+        show_edge: bool,
+    ) -> "RenderResult":
+        """Render additional header rows for column groups.
+
+        Group titles are rendered across the span of their covered leaf columns,
+        using the actual column widths, and wrapped if the span is too narrow.
+        """
+        _Segment = Segment
+        new_line = Segment.line()
+        levels = self._group_levels(self._resolve_group_spans())
+        divider_width = 1 if _box else 0
+        header_style = console.get_style(self.header_style or "")
+        get_style = console.get_style
+        for cells in levels:
+            span_widths: List[int] = []
+            cell_styles: List[Style] = []
+            rendered_cells: List[List[List[Segment]]] = []
+            max_height = 1
+            for group, start, end in cells:
+                span_width = sum(widths[start : end + 1]) + (end - start) * (
+                    divider_width
+                )
+                span_widths.append(span_width)
+                if group is None:
+                    cell_style = header_style
+                    lines: List[List[Segment]] = [[]]
+                else:
+                    cell_style = header_style + get_style(group.style or "")
+                    title = group.title
+                    lines = console.render_lines(
+                        (
+                            console.render_str(title, highlight=False)
+                            if isinstance(title, str)
+                            else title
+                        ),
+                        options.update(
+                            width=span_width,
+                            justify=group.justify,
+                            height=None,
+                        ),
+                        style=cell_style,
+                        pad=True,
+                    )
+                cell_styles.append(cell_style)
+                max_height = max(max_height, len(lines))
+                rendered_cells.append(lines)
+            shaped_cells = [
+                _Segment.align_bottom(lines, width, max_height, cell_style)
+                for lines, width, cell_style in zip(
+                    rendered_cells, span_widths, cell_styles
+                )
+            ]
+            for line_no in range(max_height):
+                if _box and show_edge:
+                    yield _Segment(_box.head_left, border_style)
+                for last, cell_lines in loop_last(shaped_cells):
+                    yield from cell_lines[line_no]
+                    if _box and not last:
+                        yield _Segment(_box.head_vertical, border_style)
+                if _box and show_edge:
+                    yield _Segment(_box.head_right, border_style)
+                yield new_line
+            if _box:
+                # Separator below the group row, crossing at span boundaries.
+                parts: List[str] = []
+                append = parts.append
+                if show_edge:
+                    append(_box.head_row_left)
+                for last, span_width in loop_last(span_widths):
+                    append(_box.head_row_horizontal * span_width)
+                    if not last:
+                        append(_box.head_row_cross)
+                if show_edge:
+                    append(_box.head_row_right)
+                yield _Segment("".join(parts), border_style)
+                yield new_line
 
 
 if __name__ == "__main__":  # pragma: no cover

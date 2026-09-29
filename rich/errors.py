@@ -22,6 +22,10 @@ class NotRenderableError(ConsoleError):
     """Object is not renderable."""
 
 
+class ColumnGroupError(ConsoleError):
+    """Invalid column group definition in a Table."""
+
+
 class MarkupError(ConsoleError):
     """Markup was badly formatted."""
 

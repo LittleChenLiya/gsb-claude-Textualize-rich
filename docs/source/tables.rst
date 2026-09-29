@@ -146,6 +146,8 @@ There are a number of options you can set on a column to modify how it will look
 
 Vertical Alignment
 ~~~~~~~~~~~~~~~~~~
+Column Groups
+~~~~~~~~~~~~~~
 
 You can define the vertical alignment of a column by setting the ``vertical`` parameter of the column. You can also do this per-cell by wrapping your text or renderable with a :class:`~rich.align.Align` class::
 
@@ -169,3 +171,43 @@ For instance, the following code displays two pieces of text aligned to both the
     grid.add_row("Raising shields", "[bold magenta]COMPLETED [green]:heavy_check_mark:")
 
     print(grid)
+Column Groups
+~~~~~~~~~~~~~~
++
+You can group consecutive columns under a shared group header with
+:meth:`~rich.table.Table.add_column_group`. The group title is rendered in an
+additional header row above the column headers, spanning the leaf columns it
+covers. Leaf columns are still described by regular columns; the group title
+participates in width calculation, wraps when the terminal is too narrow, and
+is aligned with the column borders::
++
+    from rich.console import Console
+    from rich.table import Table
++
+    table = Table()
+    for header in ["成功", "失败", "成功", "失败"]:
+        table.add_column(header)
+    table.add_column_group("本地", columns=[0, 1])
+    table.add_column_group("远端", columns=[2, 3])
+    table.add_row("alpha", "beta", "gamma", "delta")
++
+    Console().print(table)
++
+This produces the following output::
++
+    ┏━━━━━━━━━┳━━━━━━┳━━━━━━━┳━━━━━━━┓
+    ┃      本地      ┃     远端      ┃
+    ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+    ┃ 成功    ┃ 失败 ┃ 成功  ┃ 失败  ┃
+    ┡━━━━━━━━━╇━━━━━━╇━━━━━━━╇━━━━━━━┩
+    │ alpha   │ beta │ gamma │ delta │
+    └─────────┴──────┴───────┴───────┘
++
+Groups may be nested by passing :class:`~rich.table.ColumnGroup` instances as
+``children``, which renders one header row per nesting level. A group may also
+set ``style`` and ``justify`` for its title.
++
+Each group must cover at least one column, the covered columns must be
+consecutive, and a column may not be covered by two groups at the same level.
+Empty groups, crossing spans, and out of range column indices raise
+:exc:`~rich.errors.ColumnGroupError` before the table is rendered.
