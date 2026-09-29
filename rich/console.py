@@ -2241,6 +2241,47 @@ class Console:
         with open(path, "w", encoding="utf-8") as write_file:
             write_file.write(text)
 
+    def export_jsonl(self, *, clear: bool = True) -> str:
+        """Generate JSONL of replayable Segment events from console contents.
+
+        The recording captures text, styles, newlines and supported control
+        actions, along with a fixed canvas width and monotonically increasing
+        sequence numbers. It contains plain JSON data only and can be replayed
+        without any of the original renderable objects (see
+        :class:`rich.record.Recording`).
+
+        Args:
+            clear (bool, optional): Clear record buffer after exporting. Defaults to ``True``.
+
+        Returns:
+            str: A JSONL document.
+        """
+        from .record import Recording
+
+        assert (
+            self.record
+        ), "To export console contents set record=True in the constructor or instance"
+
+        with self._record_buffer_lock:
+            recording = Recording.from_segments(self._record_buffer, width=self.width)
+            jsonl = recording.to_jsonl()
+            if clear:
+                del self._record_buffer[:]
+        return jsonl
+
+    def save_jsonl(
+        self, path: Union[str, PathLike[str]], *, clear: bool = True
+    ) -> None:
+        """Generate JSONL from console contents and save it to a file.
+
+        Args:
+            path (Union[str, PathLike[str]]): Path to write the JSONL file.
+            clear (bool, optional): Clear record buffer after exporting. Defaults to ``True``.
+        """
+        jsonl = self.export_jsonl(clear=clear)
+        with open(path, "w", encoding="utf-8", newline="\n") as write_file:
+            write_file.write(jsonl)
+
     def export_html(
         self,
         *,

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Added JSONL segment recording and replay: `Console.export_jsonl()` and `Console.save_jsonl()` produce a replayable recording of text, styles, newlines and control actions with a fixed canvas width and monotonically increasing sequence numbers; `rich.record.Recording` validates recordings line by line (version, style fields and a control-action whitelist) and can replay them as ANSI or plain text without the original renderables
+
 ## [15.0.0] - 2026-04-12
 
 ### Changed
