@@ -22,6 +22,10 @@ class NotRenderableError(ConsoleError):
     """Object is not renderable."""
 
 
+class CellOverflowError(ConsoleError):
+    """A table cell exceeded the maximum length permitted when exporting structured data."""
+
+
 class MarkupError(ConsoleError):
     """Markup was badly formatted."""
 

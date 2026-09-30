@@ -1,6 +1,8 @@
+import json
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     Iterable,
     List,
@@ -11,7 +13,7 @@ from typing import (
     Union,
 )
 
-from . import box, errors
+from . import box, errors, get_console
 from ._loop import loop_first_last, loop_last
 from ._pick import pick_bool
 from ._ratio import ratio_distribute, ratio_reduce
@@ -460,6 +462,12 @@ class Table(JupyterMixin):
                 add_cell(column, "")
             elif is_renderable(renderable):
                 add_cell(column, renderable)
+            elif isinstance(renderable, (int, float, complex)) and not isinstance(
+                renderable, bool
+            ):
+                from .pretty import Pretty
+
+                add_cell(column, Pretty(renderable))
             else:
                 raise errors.NotRenderableError(
                     f"unable to render {type(renderable).__name__}; a string or other renderable object is required"
@@ -471,6 +479,152 @@ class Table(JupyterMixin):
 
         if self.rows:
             self.rows[-1].end_section = True
+
+    def _render_cell_text(
+        self,
+        console: "Console",
+        renderable: "RenderableType",
+        render_width: int,
+        highlight: Optional[bool] = None,
+    ) -> str:
+        """Render a cell through the console protocol and return its plain text.
+
+        The renderable is rendered exactly once. Wrapping is disabled and
+        overflow is ignored, so terminal width never truncates the content.
+        Styles and control codes are not included in the result.
+        """
+        options = console.options.update(
+            min_width=render_width,
+            max_width=render_width,
+            no_wrap=True,
+            overflow="ignore",
+            height=None,
+            highlight=self.highlight if highlight is None else highlight,
+        )
+        segments = list(console.render(renderable, options))
+        lines = [
+            "".join(segment.text for segment in line)
+            for line in Segment.split_lines(Segment.filter_control(segments))
+        ]
+        text = "\n".join(line.rstrip() for line in lines)
+        return text
+
+    def export_data(
+        self,
+        *,
+        console: Optional["Console"] = None,
+        max_cell_length: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Export the table as structured plain-text data.
+
+        Every cell renderable is rendered exactly once through the same
+        console protocol used to display the table. The result contains no
+        styles or terminal control codes; embedded newlines are preserved.
+
+        Args:
+            console (Console, optional): Console used to render cell content.
+                The shared global console is used if not supplied.
+            max_cell_length (int, optional): Maximum number of characters
+                permitted in a single cell, counting embedded newlines.
+                Defaults to ``None`` for no limit.
+
+        Raises:
+            errors.CellOverflowError: If a cell contains more than
+                ``max_cell_length`` characters. Nothing is returned or
+                written when this is raised.
+            ValueError: If ``max_cell_length`` is negative.
+
+        Returns:
+            Dict[str, Any]: A mapping with ``columns`` (each column's index,
+            name and plain-text header) and ``rows`` (each row's index and a
+            list of cells, each with the column index, column name and plain
+            text). Duplicate column names are distinguishable by index.
+        """
+        if max_cell_length is not None and max_cell_length < 0:
+            raise ValueError("max_cell_length must not be negative")
+        if console is None:
+            console = get_console()
+
+        # Characters may occupy more than one terminal cell (e.g. CJK), so
+        # reserve two cells per character, plus one, when checking a limit.
+        render_width = (
+            (max_cell_length + 1) * 2 if max_cell_length is not None else 2**20
+        )
+
+        columns: List[Dict[str, Any]] = []
+        for column_index, column in enumerate(self.columns):
+            name = self._render_cell_text(
+                console, column.header, render_width, highlight=False
+            )
+            columns.append({"index": column_index, "name": name, "header": name})
+
+        rows: List[Dict[str, Any]] = []
+        for row_index in range(len(self.rows)):
+            cells: List[Dict[str, Any]] = []
+            for column_index, column in enumerate(self.columns):
+                renderable = column._cells[row_index]
+                cell_text = self._render_cell_text(
+                    console,
+                    renderable,
+                    render_width,
+                    highlight=column.highlight,
+                )
+                if max_cell_length is not None and len(cell_text) > max_cell_length:
+                    raise errors.CellOverflowError(
+                        f"cell at row {row_index}, column {column_index} "
+                        f"({columns[column_index]['name']!r}) contains "
+                        f"{len(cell_text)} characters, exceeding the limit of "
+                        f"{max_cell_length}"
+                    )
+                cells.append(
+                    {
+                        "column_index": column_index,
+                        "column_name": columns[column_index]["name"],
+                        "text": cell_text,
+                    }
+                )
+            rows.append({"index": row_index, "cells": cells})
+
+        return {"columns": columns, "rows": rows}
+
+    def export_json(
+        self,
+        *,
+        console: Optional["Console"] = None,
+        max_cell_length: Optional[int] = None,
+        path: Optional[str] = None,
+        **json_dumps_kwargs: Any,
+    ) -> Optional[str]:
+        """Export the table's structured plain-text data as JSON.
+
+        The complete structure is built before anything is written, so a cell
+        exceeding ``max_cell_length`` fails the entire export without leaving a
+        partially written file.
+
+        Args:
+            console (Console, optional): Console used to render cell content.
+            max_cell_length (int, optional): Maximum number of characters
+                permitted in a single cell. Defaults to ``None``.
+            path (str, optional): File path to write the JSON to. Defaults to
+                ``None``, in which case the JSON string is returned.
+            **json_dumps_kwargs: Additional keyword arguments for
+                :func:`json.dumps` (e.g. ``ensure_ascii=False``).
+
+        Raises:
+            errors.CellOverflowError: If a cell exceeds ``max_cell_length``.
+
+        Returns:
+            Optional[str]: The JSON string when ``path`` is not given,
+            otherwise ``None`` (the JSON is written to ``path``).
+        """
+        data = self.export_data(console=console, max_cell_length=max_cell_length)
+        json_dumps_kwargs.setdefault("ensure_ascii", False)
+        rendered = json.dumps(data, **json_dumps_kwargs)
+        if path is None:
+            return rendered
+        with open(path, "w", encoding="utf-8") as json_file:
+            json_file.write(rendered)
+        return None
 
     def __rich_console__(
         self, console: "Console", options: "ConsoleOptions"

@@ -406,6 +406,240 @@ def test_padding_width():
     assert output == expected
 
 
+class CountingRenderable:
+    """A stateful renderable that counts invocations of __rich_console__."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.render_count = 0
+
+    def __rich_console__(self, console, options):
+        from rich.control import Control
+
+        self.render_count += 1
+        yield Text(f"{self.label} 第{self.render_count}次")
+        yield Control.bell()
+
+
+class WidthAwareRenderable:
+    """A renderable that outputs as many characters as the render width allows."""
+
+    def __rich_console__(self, console, options):
+        yield "x" * options.max_width
+
+
+def _plain_console():
+    return Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        legacy_windows=False,
+        color_system="truecolor",
+        width=80,
+    )
+
+
+def test_table_export_data_values_and_single_render():
+    console = _plain_console()
+    counting_cell = CountingRenderable("动态")
+    table = Table("姓名", "备注", "年龄")
+    table.add_row(Text("张三", style="bold red"), "第一行\n第二行", 42)
+    table.add_row("李四", counting_cell, 3.5)
+
+    data = table.export_data(console=console)
+
+    assert [column["name"] for column in data["columns"]] == [
+        "姓名",
+        "备注",
+        "年龄",
+    ]
+    assert [column["index"] for column in data["columns"]] == [0, 1, 2]
+
+    first_row = data["rows"][0]["cells"]
+    assert first_row[0]["text"] == "张三"
+    assert first_row[1]["text"] == "第一行\n第二行"
+    assert first_row[2]["text"] == "42"
+
+    second_row = data["rows"][1]["cells"]
+    assert second_row[0]["text"] == "李四"
+    assert second_row[1]["text"] == "动态 第1次"
+    assert second_row[2]["text"] == "3.5"
+    # The stateful renderable must have been rendered exactly once.
+    assert counting_cell.render_count == 1
+
+
+def test_table_export_json_roundtrip():
+    import json
+
+    table = Table("姓名")
+    table.add_row("张三")
+    rendered = table.export_json(indent=2)
+    assert "\\u" not in rendered
+    data = json.loads(rendered)
+    assert data["rows"][0]["cells"][0]["text"] == "张三"
+
+
+def test_table_export_json_writes_file(tmp_path):
+    table = Table("a")
+    table.add_row("value")
+    path = tmp_path / "table.json"
+    result = table.export_json(path=str(path))
+    assert result is None
+    import json
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["rows"][0]["cells"][0]["text"] == "value"
+
+
+def test_table_export_empty():
+    console = _plain_console()
+    table = Table("a", "b")
+    data = table.export_data(console=console)
+    assert data == {
+        "columns": [
+            {"index": 0, "name": "a", "header": "a"},
+            {"index": 1, "name": "b", "header": "b"},
+        ],
+        "rows": [],
+    }
+
+    table_without_columns = Table()
+    assert table_without_columns.export_data(console=console) == {
+        "columns": [],
+        "rows": [],
+    }
+
+
+def test_table_export_duplicate_column_names():
+    console = _plain_console()
+    table = Table("名称", "名称")
+    table.add_row("第一个", "第二个")
+    data = table.export_data(console=console)
+
+    names = [column["name"] for column in data["columns"]]
+    assert names == ["名称", "名称"]
+    cells = data["rows"][0]["cells"]
+    assert cells[0]["column_index"] == 0
+    assert cells[1]["column_index"] == 1
+    assert cells[0]["text"] == "第一个"
+    assert cells[1]["text"] == "第二个"
+
+
+def test_table_export_empty_cell_and_none():
+    console = _plain_console()
+    table = Table("a", "b")
+    table.add_row("", None)
+    data = table.export_data(console=console)
+    cells = data["rows"][0]["cells"]
+    assert cells[0]["text"] == ""
+    assert cells[1]["text"] == ""
+
+
+def test_table_export_strips_styles_and_control_codes():
+    console = _plain_console()
+    table = Table("标题")
+    table.add_row(Text("红\n绿", style="bold red"))
+    table.add_row(CountingRenderable("带控制字符"))
+    data = table.export_data(console=console)
+    text = data["rows"][0]["cells"][0]["text"]
+    assert text == "红\n绿"
+    assert "\x1b" not in text
+    assert "\x07" not in text
+    control_text = data["rows"][1]["cells"][0]["text"]
+    assert control_text == "带控制字符 第1次"
+    assert "\x07" not in control_text
+
+
+def test_table_export_does_not_wrap_or_ellipsize():
+    console = Console(width=10, file=io.StringIO())
+    table = Table()
+    table.add_column("long", overflow="ellipsis")
+    long_text = "这是一段非常非常长的文本内容"
+    table.add_row(long_text)
+    data = table.export_data(console=console)
+    assert data["rows"][0]["cells"][0]["text"] == long_text
+    assert "…" not in data["rows"][0]["cells"][0]["text"]
+
+
+def test_table_export_max_cell_length_failure():
+    console = _plain_console()
+    table = Table("a", "b")
+    table.add_row("ok", "这真的太长了")
+
+    with pytest.raises(errors.CellOverflowError) as exc_info:
+        table.export_data(console=console, max_cell_length=4)
+    message = str(exc_info.value)
+    assert "row 0" in message
+    assert "column 1" in message
+    assert "b" in message
+
+
+def test_table_export_max_cell_length_at_boundary():
+    console = _plain_console()
+    table = Table("a")
+    table.add_row("1234")
+    data = table.export_data(console=console, max_cell_length=4)
+    assert data["rows"][0]["cells"][0]["text"] == "1234"
+
+
+def test_table_export_max_cell_length_with_width_aware_renderable():
+    console = _plain_console()
+    table = Table("a")
+    table.add_row(WidthAwareRenderable())
+    with pytest.raises(errors.CellOverflowError):
+        table.export_data(console=console, max_cell_length=10)
+
+
+def test_table_export_max_cell_length_counts_newlines():
+    console = _plain_console()
+    table = Table("a")
+    table.add_row("ab\ncd")
+    with pytest.raises(errors.CellOverflowError):
+        table.export_data(console=console, max_cell_length=4)
+
+
+def test_table_export_json_failure_leaves_no_file(tmp_path):
+    console = _plain_console()
+    table = Table("a")
+    table.add_row("这真的太长了")
+    path = tmp_path / "partial.json"
+    with pytest.raises(errors.CellOverflowError):
+        table.export_json(console=console, max_cell_length=2, path=str(path))
+    assert not path.exists()
+
+
+def test_table_export_invalid_max_cell_length():
+    with pytest.raises(ValueError):
+        Table("a").export_data(max_cell_length=-1)
+
+
+def test_table_render_unchanged_by_export():
+    """Displaying the table before and after export must be identical."""
+
+    table = Table("姓名", "信息", "年龄")
+    table.add_row(Text("张三", style="bold red"), "第一行\n第二行", 42)
+    table.add_row("李四", "", 3)
+    before_console = _plain_console()
+    before_console.print(table)
+    table.export_data(console=_plain_console())
+    after_console = _plain_console()
+    after_console.print(table)
+    before = before_console.file.getvalue()
+    after = after_console.file.getvalue()
+    assert before == after
+
+
+def test_table_numbers_are_renderable_in_rows():
+    console = _plain_console()
+    table = Table("n")
+    table.add_row(1)
+    table.add_row(2.5)
+    rendered = "".join(
+        segment.text for lines in console.render_lines(table) for segment in lines
+    )
+    assert "1" in rendered
+    assert "2.5" in rendered
+
+
 if __name__ == "__main__":
     render = render_tables()
     print(render)

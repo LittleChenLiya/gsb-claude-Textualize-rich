@@ -169,3 +169,14 @@ For instance, the following code displays two pieces of text aligned to both the
     grid.add_row("Raising shields", "[bold magenta]COMPLETED [green]:heavy_check_mark:")
 
     print(grid)
+
+Structured Export
+~~~~~~~~~~~~~~~~~
+
+If you need to consume a table in code, call :meth:`~rich.table.Table.export_data` rather than parsing rendered terminal output. It renders every cell once through the console protocol and returns column names, row numbers and plain-text cells. Styles and control codes are excluded, and newlines within cells are preserved::
+
+    data = table.export_data()
+
+Duplicate column names are distinguishable by their ``index``. Pass ``max_cell_length`` to cap the number of characters per cell; if any cell exceeds the limit the whole export raises :class:`~rich.errors.CellOverflowError` -- nothing partial is returned. :meth:`~rich.table.Table.export_json` writes the same structure to a JSON string or file (set ``path``)::
+
+    json_text = table.export_json(max_cell_length=100)
