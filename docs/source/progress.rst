@@ -296,3 +296,71 @@ Example
 -------
 
 See `downloader.py <https://github.com/willmcgugan/rich/blob/master/examples/downloader.py>`_ for a realistic application of a progress display. This script can download multiple concurrent files with a progress bar, transfer speed and file size.
+
+
+Aggregated (parent / child) progress
+------------------------------------
+
+Sometimes one task ("the build") is the weighted sum of several subtasks with
+completely different totals (files of different sizes, pipeline stages, ...).
+Adding their raw ``completed`` / ``total`` numbers is meaningless, so Rich
+provides an independent aggregation layer:
+
+* :class:`~rich.progress_aggregate.ProgressAggregator` computes *state only*
+  (importable in code that never touches a terminal),
+* :class:`~rich.aggregate_progress.AggregateProgress` mirrors that state onto a
+  regular :class:`~rich.progress.Progress`, so all existing columns keep
+  working.
+
+Aggregation rules
+~~~~~~~~~~~~~~~~~
+
+* Each child contributes its **completion ratio** ``completed / total``
+  multiplied by an explicit **weight**; tasks with different totals are never
+  added directly::
+
+      parent_fraction = sum(child_ratio * child_weight) / sum(child_weight)
+
+* If any **active** child has an unknown total (``total=None``), the parent is
+  **indeterminate** and renders as a pulsing bar.
+
+* A child that finishes successfully **keeps its final contribution** (its
+  ratio at the moment it completed, normally 1.0).
+
+* A **failed child makes the parent fail** — it shows a red ``FAILED`` marker
+  and never silently becomes a completed bar when the other children finish.
+
+* Tasks are referenced through a
+  :class:`~rich.progress_aggregate.TaskIdentity`, which is **separate from the
+  plain integer id**. Removing a task and re-adding one that reuses the same
+  integer id produces a new identity (a new *generation*), so an old snapshot
+  can never be associated with the new task.
+
+Example
+~~~~~~~
+
+::
+
+    from rich.aggregate_progress import AggregateProgress
+    from rich.progress_aggregate import ProgressAggregator
+
+    aggregator = ProgressAggregator()
+    with AggregateProgress(aggregator) as progress:
+        parent = aggregator.add_parent("overall")
+        # weights 1 and 3 -> parent = (1*ratio_a + 3*ratio_b) / 4
+        a = aggregator.add_child(parent, "stage a", weight=1, total=4, completed=4)
+        b = aggregator.add_child(parent, "stage b", weight=3, total=8)
+
+        aggregator.update_child(b, completed=0)   # parent 25%
+        progress.refresh()
+        aggregator.update_child(b, completed=4)   # parent 62.5%
+        progress.refresh()
+        aggregator.update_child(b, total=None)    # parent indeterminate
+        progress.refresh()
+        aggregator.fail_child(b)                  # parent FAILED (not 100%)
+        progress.refresh()
+
+Call :meth:`~rich.progress_aggregate.ProgressAggregator.aggregate` to read the
+state without rendering; the returned
+:class:`~rich.progress_aggregate.AggregateSnapshot` is an immutable snapshot.
+See ``examples/aggregate_progress_demo.py`` for a short terminal demo.

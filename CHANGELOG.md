@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added an independent parent/child progress aggregation layer: `rich.progress_aggregate.ProgressAggregator` computes weighted aggregate state (ratios + explicit weights, indeterminate when an active child's total is unknown, failed when any child fails, frozen final contributions) and `rich.aggregate_progress.AggregateProgress` renders it with a regular `Progress`. Task identity (`TaskIdentity`, id + generation) is separate from the plain integer id, so removed and re-added tasks can't be confused via old snapshots.
+
 ## [15.0.0] - 2026-04-12
 
 ### Changed

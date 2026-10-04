@@ -22,6 +22,8 @@ Reference
    reference/padding.rst
    reference/panel.rst
    reference/pretty.rst
+   reference/aggregate_progress.rst
+   reference/progress_aggregate.rst
    reference/progress_bar.rst
    reference/progress.rst
    reference/prompt.rst
