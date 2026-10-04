@@ -24,6 +24,7 @@ Reference
    reference/pretty.rst
    reference/progress_bar.rst
    reference/progress.rst
+   reference/progress_aggregate.rst
    reference/prompt.rst
    reference/protocol.rst
    reference/rule.rst

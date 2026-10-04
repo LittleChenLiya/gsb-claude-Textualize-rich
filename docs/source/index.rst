@@ -27,6 +27,7 @@ Welcome to Rich's documentation!
    padding.rst
    panel.rst
    progress.rst
+   progress_aggregate.rst
    syntax.rst
    tables.rst
    tree.rst
