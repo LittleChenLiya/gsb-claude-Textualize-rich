@@ -150,6 +150,90 @@ class _Cell(NamedTuple):
     """Cell vertical alignment."""
 
 
+@dataclass
+class ColumnLayout:
+    """Layout information for a single column within a table.
+
+    All widths include the column's padding, matching the values Rich uses
+    internally when rendering. The content width is ``final_width - padding_width``.
+
+    Attributes:
+        index: Index of the column.
+        min_width: Minimum width of the column (content + padding), as measured.
+        max_width: Maximum width of the column (content + padding), as measured.
+        final_width: Final allocated width of the column (content + padding).
+        padding_width: Width of the cell padding for this column.
+        reason: The reason content wraps or truncates. One of ``"none"``,
+            ``"fixed_width"``, ``"max_width"``, ``"ratio"``, ``"collapse"``,
+            ``"expand"``, or ``"min_width"``.
+    """
+
+    index: int
+    """Index of the column."""
+
+    min_width: int
+    """Minimum width of the column (content + padding)."""
+
+    max_width: int
+    """Maximum width of the column (content + padding)."""
+
+    final_width: int
+    """Final allocated width of the column (content + padding)."""
+
+    padding_width: int
+    """Width of the cell padding for this column."""
+
+    reason: str
+    """Reason content wraps or truncates."""
+
+    @property
+    def content_min_width(self) -> int:
+        """Minimum content width (without padding)."""
+        return self.min_width - self.padding_width
+
+    @property
+    def content_max_width(self) -> int:
+        """Maximum content width (without padding)."""
+        return self.max_width - self.padding_width
+
+    @property
+    def content_final_width(self) -> int:
+        """Final content width (without padding)."""
+        return self.final_width - self.padding_width
+
+
+@dataclass
+class TableLayoutReport:
+    """Report of the table layout calculation.
+
+    The report lists each column's minimum, maximum, and final width, along
+    with the reason content wraps or truncates. The report is produced from the
+    same measurement pass used to render the table, so custom renderables are
+    not executed again.
+
+    Attributes:
+        columns: Layout information for each column.
+        total_width: Total table width, including borders and padding.
+        border_width: Width of the borders (edge + dividers).
+        padding_width: Total padding width across all columns.
+    """
+
+    columns: List[ColumnLayout]
+    """Layout information for each column."""
+
+    total_width: int
+    """Total table width, including borders and padding."""
+
+    border_width: int
+    """Width of the borders (edge + dividers)."""
+
+    padding_width: int
+    """Total padding width across all columns."""
+
+    def __iter__(self) -> Iterable["ColumnLayout"]:
+        return iter(self.columns)
+
+
 class Table(JupyterMixin):
     """A console renderable to draw a table.
 
@@ -241,6 +325,7 @@ class Table(JupyterMixin):
         self.caption_justify: "JustifyMethod" = caption_justify
         self.highlight = highlight
         self.row_styles: Sequence[StyleType] = list(row_styles or [])
+        self._layout_report: Optional[TableLayoutReport] = None
         append_column = self.columns.append
         for header in headers:
             if isinstance(header, str):
@@ -317,6 +402,52 @@ class Table(JupyterMixin):
             style += console.get_style(row_style)
         return style
 
+    @property
+    def layout_report(self) -> Optional["TableLayoutReport"]:
+        """The layout report from the most recent render, or ``None`` if the
+        table has not been rendered yet.
+
+        The report is produced from the same measurement pass used to render
+        the table, so custom renderables are not executed again.
+        """
+        return self._layout_report
+
+    def get_layout_report(
+        self,
+        console: Optional["Console"] = None,
+        options: Optional["ConsoleOptions"] = None,
+    ) -> "TableLayoutReport":
+        """Compute and return a layout report for this table.
+
+        The report lists each column's minimum, maximum, and final width, along
+        with the reason content wraps or truncates. It runs the same layout
+        calculation as :meth:`__rich_console__`, so the result is consistent
+        with normal rendering and custom renderables are not re-executed.
+
+        Args:
+            console: Console instance. If ``None``, a new :class:`~rich.console.Console`
+                is created.
+            options: Console options. If ``None``, the console's default options
+                are used.
+
+        Returns:
+            TableLayoutReport: The layout report.
+        """
+        if console is None:
+            from .console import Console
+
+            console = Console()
+        if options is None:
+            options = console.options
+        max_width = options.max_width
+        if self.width is not None:
+            max_width = self.width
+        extra_width = self._extra_width
+        _, report = self._calculate_layout(
+            console, options.update_width(max_width - extra_width)
+        )
+        return report
+
     def __rich_measure__(
         self, console: "Console", options: "ConsoleOptions"
     ) -> Measurement:
@@ -328,9 +459,9 @@ class Table(JupyterMixin):
 
         extra_width = self._extra_width
         max_width = sum(
-            self._calculate_column_widths(
+            self._calculate_layout(
                 console, options.update_width(max_width - extra_width)
-            )
+            )[0]
         )
         _measure_column = self._measure_column
 
@@ -485,7 +616,7 @@ class Table(JupyterMixin):
 
         extra_width = self._extra_width
 
-        widths = self._calculate_column_widths(
+        widths, self._layout_report = self._calculate_layout(
             console, options.update_width(max_width - extra_width)
         )
         table_width = sum(widths) + extra_width
@@ -520,19 +651,40 @@ class Table(JupyterMixin):
                 justify=self.caption_justify,
             )
 
-    def _calculate_column_widths(
+    def _calculate_layout(
         self, console: "Console", options: "ConsoleOptions"
-    ) -> List[int]:
-        """Calculate the widths of each column, including padding, not including borders."""
+    ) -> Tuple[List[int], "TableLayoutReport"]:
+        """Calculate the widths of each column and produce a layout report.
+
+        This is the single measurement pass used by both :meth:`__rich_measure__`
+        and :meth:`__rich_console__`. The report is built from the same
+        measurements, so custom renderables are not executed again.
+
+        Returns:
+            Tuple[List[int], TableLayoutReport]: A tuple of column widths
+                (including padding, not including borders) and a layout report.
+        """
         max_width = options.max_width
         columns = self.columns
         width_ranges = [
             self._measure_column(console, options, column) for column in columns
         ]
+        # Preserve the natural content measurements for the report; the
+        # collapse re-measurement below clamps widths to the collapsed size.
+        report_ranges = width_ranges
         widths = [_range.maximum or 1 for _range in width_ranges]
+        reasons = ["none"] * len(columns)
 
         get_padding_width = self._get_padding_width
         extra_width = self._extra_width
+
+        # Fixed width / max_width columns keep their constraint as the reason.
+        for index, column in enumerate(columns):
+            if column.width is not None:
+                reasons[index] = "fixed_width"
+            elif column.max_width is not None:
+                reasons[index] = "max_width"
+
         if self.expand:
             ratios = [col.ratio or 0 for col in columns if col.flexible]
             if any(ratios):
@@ -551,9 +703,12 @@ class Table(JupyterMixin):
                 for index, column in enumerate(columns):
                     if column.flexible:
                         widths[index] = fixed_widths[index] + next(iter_flex_widths)
+                        if reasons[index] == "none":
+                            reasons[index] = "ratio"
         table_width = sum(widths)
 
         if table_width > max_width:
+            old_widths = widths[:]
             widths = self._collapse_widths(
                 widths,
                 [(column.width is None and not column.no_wrap) for column in columns],
@@ -572,6 +727,10 @@ class Table(JupyterMixin):
             ]
             widths = [_range.maximum or 0 for _range in width_ranges]
 
+            for index in range(len(columns)):
+                if widths[index] < old_widths[index] and reasons[index] == "none":
+                    reasons[index] = "collapse"
+
         if (table_width < max_width and self.expand) or (
             self.min_width is not None and table_width < (self.min_width - extra_width)
         ):
@@ -582,8 +741,45 @@ class Table(JupyterMixin):
             )
             pad_widths = ratio_distribute(_max_width - table_width, widths)
             widths = [_width + pad for _width, pad in zip(widths, pad_widths)]
+            pad_reason = "expand" if self.expand else "min_width"
+            for index in range(len(columns)):
+                if reasons[index] == "none":
+                    reasons[index] = pad_reason
 
-        return widths
+        report = self._build_layout_report(report_ranges, widths, reasons, extra_width)
+        return widths, report
+
+    def _build_layout_report(
+        self,
+        width_ranges: List["Measurement"],
+        widths: List[int],
+        reasons: List[str],
+        extra_width: int,
+    ) -> "TableLayoutReport":
+        """Build a layout report from measurements and final widths."""
+        columns: List[ColumnLayout] = []
+        total_padding = 0
+        for index, (_range, final_width, reason) in enumerate(
+            zip(width_ranges, widths, reasons)
+        ):
+            padding_width = self._get_padding_width(index)
+            total_padding += padding_width
+            columns.append(
+                ColumnLayout(
+                    index=index,
+                    min_width=_range.minimum,
+                    max_width=_range.maximum,
+                    final_width=final_width,
+                    padding_width=padding_width,
+                    reason=reason,
+                )
+            )
+        return TableLayoutReport(
+            columns=columns,
+            total_width=sum(widths) + extra_width,
+            border_width=extra_width,
+            padding_width=total_padding,
+        )
 
     @classmethod
     def _collapse_widths(

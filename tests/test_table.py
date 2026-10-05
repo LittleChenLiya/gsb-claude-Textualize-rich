@@ -8,8 +8,9 @@ import pytest
 from rich import box, errors
 from rich.console import Console
 from rich.measure import Measurement
+from rich.segment import Segment
 from rich.style import Style
-from rich.table import Column, Table
+from rich.table import Column, Table, TableLayoutReport
 from rich.text import Text
 
 
@@ -404,6 +405,202 @@ def test_padding_width():
     print(repr(output))
     expected = "aaa aaa aaa\n"
     assert output == expected
+
+
+# ---------------------------------------------------------------------------
+# Layout report tests
+# ---------------------------------------------------------------------------
+
+
+def _fixed_console(width: int = 60) -> Console:
+    """Get a console with a fixed terminal width."""
+    return Console(
+        width=width,
+        height=25,
+        force_terminal=True,
+        legacy_windows=False,
+        color_system=None,
+        _environ={},
+    )
+
+
+def test_layout_report_chinese_english_mixed():
+    """A Chinese-English mixed table at a fixed width has the correct total."""
+    console = _fixed_console(40)
+    table = Table(expand=False)
+    table.add_column("Name")
+    table.add_column("Description")
+    table.add_row("Alice", "一个中英文混合的描述内容")
+    table.add_row("Bob", "short")
+
+    report = table.get_layout_report(console)
+
+    assert isinstance(report, TableLayoutReport)
+    # Total width must not exceed the terminal width.
+    assert report.total_width <= 40
+    # The Chinese description is 12 CJK characters = 24 cells, plus padding 2.
+    desc = report.columns[1]
+    assert desc.max_width == 26
+    # Total = col0 (7) + col1 (26) + border (3) = 36.
+    assert report.total_width == 36
+    # Borders and padding are counted in the total.
+    assert report.border_width == 3
+    assert report.padding_width == 4
+    # The report does not store cell text.
+    assert not hasattr(report, "cells")
+    assert not hasattr(report, "renderables")
+
+
+def test_layout_report_collapse_reason():
+    """Columns that shrink to fit the terminal report the collapse reason."""
+    console = _fixed_console(30)
+    table = Table(expand=False)
+    table.add_column("foo")
+    table.add_column("bar")
+    table.add_row("this is a long sentence that wraps", "another long sentence here")
+
+    report = table.get_layout_report(console)
+
+    assert report.total_width == 30
+    for column in report.columns:
+        assert column.reason == "collapse"
+        assert column.final_width < column.max_width
+
+
+def test_layout_report_fixed_width_reason():
+    """A fixed-width column reports the fixed_width reason."""
+    console = _fixed_console(60)
+    table = Table(expand=False)
+    table.add_column("foo", width=10)
+    table.add_column("bar")
+    table.add_row("a", "this is a long sentence")
+
+    report = table.get_layout_report(console)
+
+    assert report.columns[0].reason == "fixed_width"
+    assert report.columns[0].final_width == 12  # 10 + padding
+
+
+def test_layout_report_expand_reason():
+    """An expanded table reports the expand reason and fills the terminal."""
+    console = _fixed_console(50)
+    table = Table(expand=True)
+    table.add_column("foo")
+    table.add_column("bar")
+    table.add_row("a", "b")
+
+    report = table.get_layout_report(console)
+
+    assert report.total_width == 50
+    for column in report.columns:
+        assert column.reason == "expand"
+
+
+def test_layout_report_min_width_reason():
+    """A table constrained by min_width reports the min_width reason."""
+    console = _fixed_console(60)
+    table = Table(expand=False, min_width=50)
+    table.add_column("foo")
+    table.add_row("short")
+
+    report = table.get_layout_report(console)
+
+    assert report.total_width == 50
+    assert report.columns[0].reason == "min_width"
+
+
+def test_layout_report_consistency_with_render():
+    """The standalone report matches the report captured during rendering."""
+    console = _fixed_console(40)
+    table = Table(expand=False)
+    table.add_column("Name")
+    table.add_column("Description")
+    table.add_row("Alice", "一个中英文混合的描述内容")
+    table.add_row("Bob", "short")
+
+    standalone = table.get_layout_report(console)
+    console.print(table)
+    rendered = table.layout_report
+
+    assert rendered is not None
+    assert standalone.total_width == rendered.total_width
+    assert standalone.border_width == rendered.border_width
+    assert standalone.padding_width == rendered.padding_width
+    for a, b in zip(standalone.columns, rendered.columns):
+        assert a.final_width == b.final_width
+        assert a.reason == b.reason
+
+
+def test_layout_report_counting_renderable():
+    """The report must not cause custom renderables to be re-executed."""
+
+    class CountingRenderable:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.measure_count = 0
+
+        def __rich_measure__(self, console: Console, options):
+            self.measure_count += 1
+            from rich.cells import cell_len
+
+            width = cell_len(self.text)
+            return Measurement(width, width)
+
+        def __rich_console__(self, console: Console, options):
+            yield Segment(self.text)
+
+    console = _fixed_console(60)
+    table = Table(expand=False)
+    table.add_column("A")
+    table.add_column("B")
+    r1 = CountingRenderable("hello")
+    r2 = CountingRenderable("world")
+    table.add_row(r1, r2)
+
+    # Generate a standalone report: each renderable is measured once.
+    report = table.get_layout_report(console)
+    assert r1.measure_count == 1
+    assert r2.measure_count == 1
+
+    # Rendering captures the report for free; no extra measurements.
+    r1.measure_count = 0
+    r2.measure_count = 0
+    console.print(table)
+    assert r1.measure_count == 1
+    assert r2.measure_count == 1
+    assert table.layout_report is not None
+    assert table.layout_report.total_width == report.total_width
+
+
+def test_layout_report_padding_counted():
+    """Padding is counted in column widths and the total."""
+    console = _fixed_console(60)
+    table = Table(expand=False, padding=(1, 2), box=None)
+    table.add_column("foo")
+    table.add_row("bar")
+
+    report = table.get_layout_report(console)
+
+    # padding = top 1 + right 2 + bottom 1 + left 2; horizontal = 4
+    assert report.columns[0].padding_width == 4
+    assert report.padding_width == 4
+    # content "bar" = 3, plus padding 4 = 7
+    assert report.columns[0].final_width == 7
+    # no edge box: total = final width only
+    assert report.total_width == 7
+
+
+def test_layout_report_no_wrap():
+    """A no_wrap column that fits reports the none reason."""
+    console = _fixed_console(60)
+    table = Table(expand=False)
+    table.add_column("foo", no_wrap=True)
+    table.add_row("short")
+
+    report = table.get_layout_report(console)
+
+    assert report.columns[0].reason == "none"
+    assert report.columns[0].final_width == report.columns[0].max_width
 
 
 if __name__ == "__main__":
