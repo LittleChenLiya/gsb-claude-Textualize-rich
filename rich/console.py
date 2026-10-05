@@ -15,6 +15,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Collection,
     Dict,
     Iterable,
     List,
@@ -40,7 +41,7 @@ from ._fileno import get_fileno
 from ._log_render import FormatTimeCallable, LogRender
 from .align import Align, AlignMethod
 from .color import ColorSystem, blend_rgb
-from .control import Control
+from .control import Control, ControlPolicy, control_diagnostic
 from .emoji import EmojiVariant
 from .highlighter import NullHighlighter, ReprHighlighter
 from .markup import render as render_markup
@@ -49,7 +50,7 @@ from .pager import Pager, SystemPager
 from .protocol import rich_cast
 from .region import Region
 from .screen import Screen
-from .segment import Segment
+from .segment import ControlType, Segment
 from .style import Style, StyleType
 from .styled import Styled
 from .terminal_theme import DEFAULT_TERMINAL_THEME, SVG_EXPORT_THEME, TerminalTheme
@@ -388,7 +389,7 @@ class PagerContext:
     ) -> None:
         if exc_type is None:
             with self._console._lock:
-                buffer: List[Segment] = self._console._buffer[:]
+                buffer = self._console._apply_control_policy(self._console._buffer[:])
                 del self._console._buffer[:]
                 segments: Iterable[Segment] = buffer
                 if not self.styles:
@@ -599,6 +600,16 @@ class Console:
         tab_size (int, optional): Number of spaces used to replace a tab character. Defaults to 8.
         record (bool, optional): Boolean to enable recording of terminal output,
             required to call :meth:`export_html`, :meth:`export_svg`, and :meth:`export_text`. Defaults to False.
+        control_policy (Union[ControlPolicy, Collection[ControlType], Callable[[ControlType], bool]], optional):
+            An explicit policy for which control sequences may be written. May be a
+            :class:`~rich.control.ControlPolicy` instance, a collection of permitted
+            :class:`~rich.segment.ControlType` values, or a callable taking a
+            :class:`~rich.segment.ControlType` and returning ``True`` if it is permitted.
+            If ``None`` (the default), all control sequences are permitted.
+        control_policy_mode (str, optional): What to do when a control sequence is not
+            permitted. ``"diagnose"`` replaces it with a visible diagnostic; ``"reject"``
+            raises a :class:`~rich.errors.ControlPolicyError` before anything is written.
+            Defaults to ``"diagnose"``.
         markup (bool, optional): Boolean to enable :ref:`console_markup`. Defaults to True.
         emoji (bool, optional): Enable emoji code. Defaults to True.
         emoji_variant (str, optional): Optional emoji variant, either "text" or "emoji". Defaults to None.
@@ -636,6 +647,10 @@ class Console:
         no_color: Optional[bool] = None,
         tab_size: int = 8,
         record: bool = False,
+        control_policy: Optional[
+            Union[ControlPolicy, Collection[ControlType], Callable[[ControlType], bool]]
+        ] = None,
+        control_policy_mode: Literal["diagnose", "reject"] = "diagnose",
         markup: bool = True,
         emoji: bool = True,
         emoji_variant: Optional[EmojiVariant] = None,
@@ -671,6 +686,14 @@ class Console:
 
         self.tab_size = tab_size
         self.record = record
+        if control_policy is None:
+            self._control_policy: Optional[ControlPolicy] = None
+        elif isinstance(control_policy, ControlPolicy):
+            self._control_policy = control_policy
+        else:
+            self._control_policy = ControlPolicy(
+                control_policy, mode=control_policy_mode
+            )
         self._markup = markup
         self._emoji = emoji
         self._emoji_variant: Optional[EmojiVariant] = emoji_variant
@@ -873,7 +896,8 @@ class Console:
         Returns:
             str: Console output.
         """
-        render_result = self._render_buffer(self._buffer)
+        buffer = self._apply_control_policy(self._buffer[:])
+        render_result = self._render_buffer(buffer)
         del self._buffer[:]
         self._exit_buffer()
         return render_result
@@ -2060,15 +2084,19 @@ class Console:
         """Write the buffer to the output file."""
 
         with self._lock:
-            if self.record and not self._buffer_index:
-                with self._record_buffer_lock:
-                    self._record_buffer.extend(self._buffer[:])
-
             if self._buffer_index == 0:
+                # Apply the control sequence policy before recording or writing,
+                # so that record and output use the same decision.
+                buffer = self._apply_control_policy(self._buffer[:])
+
+                if self.record:
+                    with self._record_buffer_lock:
+                        self._record_buffer.extend(buffer)
+
                 if self.is_jupyter:  # pragma: no cover
                     from .jupyter import display
 
-                    display(self._buffer, self._render_buffer(self._buffer[:]))
+                    display(buffer, self._render_buffer(buffer))
                     del self._buffer[:]
                 else:
                     if WINDOWS:
@@ -2084,14 +2112,14 @@ class Console:
                             from rich._win32_console import LegacyWindowsTerm
                             from rich._windows_renderer import legacy_windows_render
 
-                            buffer = self._buffer[:]
+                            render_buffer = buffer
                             if self.no_color and self._color_system:
-                                buffer = list(Segment.remove_color(buffer))
+                                render_buffer = list(Segment.remove_color(render_buffer))
 
-                            legacy_windows_render(buffer, LegacyWindowsTerm(self.file))
+                            legacy_windows_render(render_buffer, LegacyWindowsTerm(self.file))
                         else:
                             # Either a non-std stream on legacy Windows, or modern Windows.
-                            text = self._render_buffer(self._buffer[:])
+                            text = self._render_buffer(buffer)
                             # https://bugs.python.org/issue37871
                             # https://github.com/python/cpython/issues/82052
                             # We need to avoid writing more than 32Kb in a single write, due to the above bug
@@ -2119,7 +2147,7 @@ class Console:
                                 error.reason = f"{error.reason}\n*** You may need to add PYTHONIOENCODING=utf-8 to your environment ***"
                                 raise
                     else:
-                        text = self._render_buffer(self._buffer[:])
+                        text = self._render_buffer(buffer)
                         try:
                             self.file.write(text)
                         except UnicodeEncodeError as error:
@@ -2128,6 +2156,39 @@ class Console:
 
                     self.file.flush()
                     del self._buffer[:]
+
+    def _apply_control_policy(self, segments: List[Segment]) -> List[Segment]:
+        """Apply the control sequence policy to buffered segments.
+
+        Returns a new list of segments where unauthorized control segments have
+        been replaced by visible diagnostics (``mode="diagnose"``) or have caused a
+        :class:`~rich.errors.ControlPolicyError` (``mode="reject"``). Non-control
+        segments are returned unchanged.
+
+        The policy only inspects the structured ``control`` attribute of segments;
+        ordinary text that happens to look like a control sequence is left alone.
+        """
+        policy = self._control_policy
+        if policy is None:
+            return segments
+        result: List[Segment] = []
+        append = result.append
+        for segment in segments:
+            control = segment.control
+            if control:
+                blocked = [
+                    code[0] for code in control if not policy.is_allowed(code[0])
+                ]
+                if blocked:
+                    if policy.mode == "reject":
+                        raise errors.ControlPolicyError(
+                            f"Control sequence {blocked[0].name!r} is not permitted by the console control policy"
+                        )
+                    for control_type in blocked:
+                        append(Segment(control_diagnostic(control_type)))
+                    continue
+            append(segment)
+        return result
 
     def _render_buffer(self, buffer: Iterable[Segment]) -> str:
         """Render buffered output, and clear buffer."""

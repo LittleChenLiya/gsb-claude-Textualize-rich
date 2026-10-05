@@ -1,4 +1,11 @@
-from rich.control import Control, escape_control_codes, strip_control_codes
+from rich.control import (
+    Control,
+    ControlPolicy,
+    control_diagnostic,
+    escape_control_codes,
+    strip_control_codes,
+)
+from rich.errors import ControlPolicyError
 from rich.segment import ControlType, Segment
 
 
@@ -60,3 +67,38 @@ def test_title():
         None,
         [(ControlType.SET_WINDOW_TITLE, "hello")],
     )
+
+
+def test_control_policy_default_allows_all():
+    policy = ControlPolicy()
+    assert policy.is_allowed(ControlType.CLEAR)
+    assert policy.is_allowed(ControlType.BELL)
+    assert policy.mode == "diagnose"
+
+
+def test_control_policy_collection():
+    policy = ControlPolicy({ControlType.CURSOR_UP, ControlType.CURSOR_DOWN})
+    assert policy.is_allowed(ControlType.CURSOR_UP)
+    assert policy.is_allowed(ControlType.CURSOR_DOWN)
+    assert not policy.is_allowed(ControlType.CLEAR)
+    assert not policy.is_allowed(ControlType.BELL)
+
+
+def test_control_policy_callable():
+    policy = ControlPolicy(lambda ct: ct == ControlType.CLEAR, mode="reject")
+    assert policy.is_allowed(ControlType.CLEAR)
+    assert not policy.is_allowed(ControlType.BELL)
+    assert policy.mode == "reject"
+
+
+def test_control_policy_invalid_mode():
+    import pytest
+
+    with pytest.raises(ValueError):
+        ControlPolicy(mode="bogus")
+
+
+def test_control_diagnostic():
+    diagnostic = control_diagnostic(ControlType.CLEAR)
+    assert "CLEAR" in diagnostic
+    assert "\x1b" not in diagnostic

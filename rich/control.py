@@ -1,5 +1,16 @@
 import time
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Union, Final
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Collection,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Union,
+    Final,
+)
 
 from .segment import ControlCode, ControlType, Segment
 
@@ -176,6 +187,79 @@ class Control:
     ) -> "RenderResult":
         if self.segment.text:
             yield self.segment
+
+
+def control_diagnostic(control_type: ControlType) -> str:
+    """Return visible text representing a blocked control sequence.
+
+    Used by the console control policy in ``diagnose`` mode to render a visible
+    placeholder for a control sequence that was not authorized.
+
+    Args:
+        control_type: The control type that was blocked.
+
+    Returns:
+        str: Visible diagnostic text.
+    """
+    return f"[blocked control: {control_type.name}]"
+
+
+class ControlPolicy:
+    """Policy for which control sequences may be written to a :class:`~rich.console.Console`.
+
+    A ``ControlPolicy`` authorizes a set of :class:`~rich.segment.ControlType`
+    values. Unauthorized control segments are either replaced with a visible
+    diagnostic (``mode="diagnose"``) or cause a
+    :class:`~rich.errors.ControlPolicyError` to be raised (``mode="reject"``),
+    depending on :attr:`mode`.
+
+    The policy only inspects the structured ``control`` attribute of a segment;
+    ordinary text that happens to look like a control sequence is left alone.
+
+    Args:
+        allowed: A collection of :class:`~rich.segment.ControlType` values that
+            are permitted, or a callable taking a :class:`~rich.segment.ControlType`
+            and returning ``True`` if it is permitted. If ``None`` (the default),
+            all control types are permitted.
+        mode: What to do when a control is not permitted. ``"diagnose"`` replaces
+            the control with a visible diagnostic; ``"reject"`` raises a
+            :class:`~rich.errors.ControlPolicyError` before anything is written.
+            Defaults to ``"diagnose"``.
+    """
+
+    __slots__ = ["_allowed", "mode"]
+
+    def __init__(
+        self,
+        allowed: Optional[Union[Collection[ControlType], Callable[[ControlType], bool]]] = None,
+        mode: Literal["diagnose", "reject"] = "diagnose",
+    ) -> None:
+        if mode not in ("diagnose", "reject"):
+            raise ValueError("mode must be 'diagnose' or 'reject'")
+        self.mode = mode
+        if allowed is None:
+            self._allowed: Optional[Callable[[ControlType], bool]] = None
+        elif callable(allowed):
+            self._allowed = allowed
+        else:
+            allowed_types = frozenset(allowed)
+            self._allowed = allowed_types.__contains__
+
+    def is_allowed(self, control_type: ControlType) -> bool:
+        """Check if a control type is permitted by this policy.
+
+        Args:
+            control_type: The control type to check.
+
+        Returns:
+            bool: ``True`` if the control type is permitted, ``False`` otherwise.
+        """
+        if self._allowed is None:
+            return True
+        return bool(self._allowed(control_type))
+
+    def __repr__(self) -> str:
+        return f"<ControlPolicy {self.mode}>"
 
 
 def strip_control_codes(

@@ -21,12 +21,13 @@ from rich.console import (
     group,
 )
 from rich.control import Control
+from rich.errors import ControlPolicyError
 from rich.measure import measure_renderables
 from rich.padding import Padding
 from rich.pager import SystemPager
 from rich.panel import Panel
 from rich.region import Region
-from rich.segment import Segment
+from rich.segment import ControlType, Segment
 from rich.status import Status
 from rich.style import Style
 from rich.text import Text
@@ -378,6 +379,135 @@ def test_control() -> None:
     console.control(Control.clear())
     console.print("BAR")
     assert console.file.getvalue() == "\x1b[2JBAR\n"
+
+
+CURSOR_CONTROLS = {
+    ControlType.CURSOR_UP,
+    ControlType.CURSOR_DOWN,
+    ControlType.CURSOR_FORWARD,
+    ControlType.CURSOR_BACKWARD,
+    ControlType.CURSOR_MOVE_TO,
+    ControlType.CURSOR_MOVE_TO_COLUMN,
+}
+
+
+def test_control_policy_diagnose() -> None:
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        control_policy=CURSOR_CONTROLS,
+    )
+    console.control(Control.move(3, 4))
+    console.control(Control.clear())
+    output = console.file.getvalue()
+    # Authorized cursor movement passes through as a real control sequence.
+    assert "\x1b[3C" in output
+    assert "\x1b[4B" in output
+    # The unauthorized clear is replaced by a visible diagnostic, not an escape sequence.
+    assert "\x1b[2J" not in output
+    assert "blocked control: CLEAR" in output
+
+
+def test_control_policy_reject() -> None:
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        control_policy=CURSOR_CONTROLS,
+        control_policy_mode="reject",
+    )
+    console.control(Control.move(1, 1))
+    with pytest.raises(ControlPolicyError):
+        console.control(Control.clear())
+    output = console.file.getvalue()
+    # The blocked control is never written; the earlier authorized move is.
+    assert "\x1b[2J" not in output
+    assert "\x1b[1C" in output
+
+
+def test_control_policy_text_not_treated_as_control() -> None:
+    # Ordinary text that looks like a control sequence must pass through as text.
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        highlight=False,
+        control_policy=CURSOR_CONTROLS,
+        control_policy_mode="reject",
+    )
+    console.print("\x1b[2J")
+    assert "\x1b[2J" in console.file.getvalue()
+
+
+def test_control_policy_independent_consoles() -> None:
+    cursor_console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        control_policy=CURSOR_CONTROLS,
+        control_policy_mode="reject",
+    )
+    clear_console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        control_policy={ControlType.CLEAR},
+        control_policy_mode="reject",
+    )
+    cursor_console.control(Control.move(1, 1))
+    with pytest.raises(ControlPolicyError):
+        cursor_console.control(Control.clear())
+    clear_console.control(Control.clear())
+    with pytest.raises(ControlPolicyError):
+        clear_console.control(Control.move(1, 1))
+    assert "\x1b[2J" not in cursor_console.file.getvalue()
+    assert "\x1b[2J" in clear_console.file.getvalue()
+
+
+def test_control_policy_record_matches_writer() -> None:
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        record=True,
+        control_policy=CURSOR_CONTROLS,
+    )
+    console.control(Control.move(2, 2))
+    console.control(Control.clear())
+    writer_output = console.file.getvalue()
+    recorded = console.export_text(styles=True, clear=False)
+    assert writer_output == recorded
+    assert "\x1b[2C" in writer_output
+    assert "\x1b[2J" not in writer_output
+    assert "blocked control: CLEAR" in writer_output
+
+
+def test_control_policy_capture() -> None:
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        control_policy=CURSOR_CONTROLS,
+    )
+    with console.capture() as capture:
+        console.control(Control.clear())
+    captured = capture.get()
+    assert "\x1b[2J" not in captured
+    assert "blocked control: CLEAR" in captured
+
+
+def test_control_policy_print_control() -> None:
+    console = Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        _environ={},
+        control_policy=CURSOR_CONTROLS,
+        control_policy_mode="reject",
+    )
+    with pytest.raises(ControlPolicyError):
+        console.print(Control.clear())
+    assert "\x1b[2J" not in console.file.getvalue()
 
 
 def test_capture() -> None:
