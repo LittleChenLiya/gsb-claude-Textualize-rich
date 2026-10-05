@@ -1,7 +1,9 @@
 import time
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Union, Final
 
+from . import errors
 from .segment import ControlCode, ControlType, Segment
+from .style import Style
 
 if TYPE_CHECKING:
     from .console import Console, ConsoleOptions, RenderResult
@@ -43,6 +45,99 @@ CONTROL_CODES_FORMAT: Dict[int, Callable[..., str]] = {
     ControlType.CURSOR_MOVE_TO: lambda x, y: f"\x1b[{y+1};{x+1}H",
     ControlType.SET_WINDOW_TITLE: lambda title: f"\x1b]0;{title}\x07",
 }
+
+
+class ControlPolicy:
+    """An explicit policy deciding which control sequences a console may emit.
+
+    Only control codes whose :class:`~rich.segment.ControlType` has been
+    authorized via ``allow`` are written to the terminal. Any other control
+    code is either replaced with a visible diagnostic
+    (``on_disallowed="diagnose"``) or causes the write to fail with
+    :class:`~rich.errors.ControlSequenceRejected` (``on_disallowed="reject"``)
+    *before* any part of the offending sequence is emitted, so a rejected
+    sequence can never be partially written.
+
+    Plain text is never inspected: a string that merely *looks* like a
+    control sequence is always treated as text and is never interpreted,
+    rejected, or rewritten by the policy.
+
+    Args:
+        allow (Iterable[ControlType], optional): Control types the caller
+            authorizes the console to emit. Defaults to an empty set (deny all).
+        on_disallowed (str, optional): What to do with a non-authorized control
+            code, either ``"diagnose"`` (emit a visible diagnostic instead) or
+            ``"reject"`` (raise an error before writing). Defaults to ``"diagnose"``.
+    """
+
+    DIAGNOSTIC_STYLE: Final = Style.parse("bold red reverse")
+
+    def __init__(
+        self,
+        allow: Iterable[ControlType] = (),
+        *,
+        on_disallowed: str = "diagnose",
+    ) -> None:
+        self.allowed = frozenset(
+            ControlType(control_type) for control_type in allow
+        )
+        if on_disallowed not in ("diagnose", "reject"):
+            raise ValueError(
+                f"on_disallowed must be 'diagnose' or 'reject', not {on_disallowed!r}"
+            )
+        self.on_disallowed = on_disallowed
+
+    def __repr__(self) -> str:
+        allowed = ", ".join(sorted(control.name for control in self.allowed))
+        return f"ControlPolicy(allow={{{allowed}}}, on_disallowed={self.on_disallowed!r})"
+
+    def denied_types(self, segment: Segment) -> List[ControlType]:
+        """Get the non-authorized control types in a segment.
+
+        Args:
+            segment (Segment): A segment to check.
+
+        Returns:
+            List[ControlType]: Control types in the segment not permitted by
+                this policy (empty if the segment is permitted).
+        """
+        if segment.control is None:
+            return []
+        allowed = self.allowed
+        return [
+            control_type
+            for control_type, *_
+            in segment.control
+            if control_type not in allowed
+        ]
+
+    def apply(self, segment: Segment) -> Iterable[Segment]:
+        """Apply the policy to a single segment.
+
+        Args:
+            segment (Segment): The segment to check.
+
+        Yields:
+            Segment: The original segment if permitted (or if it is plain
+                text), or a visible diagnostic segment in ``"diagnose"`` mode.
+
+        Raises:
+            ControlSequenceRejected: If the segment contains a non-authorized
+                control code and the policy is in ``"reject"`` mode.
+        """
+        denied = self.denied_types(segment)
+        if not denied:
+            yield segment
+            return
+        names = ", ".join(sorted({control_type.name for control_type in denied}))
+        if self.on_disallowed == "reject":
+            raise errors.ControlSequenceRejected(
+                f"control sequence(s) not permitted by this console's control policy: {names}"
+            )
+        yield Segment(
+            f"<control {names} denied>",
+            self.DIAGNOSTIC_STYLE,
+        )
 
 
 class Control:

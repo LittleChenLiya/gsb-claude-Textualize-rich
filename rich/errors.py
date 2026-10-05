@@ -32,3 +32,7 @@ class LiveError(ConsoleError):
 
 class NoAltScreen(ConsoleError):
     """Alt screen mode was required."""
+
+
+class ControlSequenceRejected(ConsoleError):
+    """A control sequence was rejected by the console's control policy."""

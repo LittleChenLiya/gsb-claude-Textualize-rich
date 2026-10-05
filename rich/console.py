@@ -40,7 +40,7 @@ from ._fileno import get_fileno
 from ._log_render import FormatTimeCallable, LogRender
 from .align import Align, AlignMethod
 from .color import ColorSystem, blend_rgb
-from .control import Control
+from .control import Control, ControlPolicy
 from .emoji import EmojiVariant
 from .highlighter import NullHighlighter, ReprHighlighter
 from .markup import render as render_markup
@@ -612,6 +612,9 @@ class Console:
         get_datetime (Callable[[], datetime], optional): Callable that gets the current time as a datetime.datetime object (used by Console.log),
             or None for datetime.now.
         get_time (Callable[[], time], optional): Callable that gets the current time in seconds, default uses time.monotonic.
+        control_policy (ControlPolicy, optional): An explicit policy deciding which control sequences this
+            console may emit, or ``None`` to permit all control sequences (the default). The policy applies
+            only to this console, and governs both the written output and anything recorded via ``record``.
     """
 
     _environ: Mapping[str, str] = os.environ
@@ -648,6 +651,7 @@ class Console:
         safe_box: bool = True,
         get_datetime: Optional[Callable[[], datetime]] = None,
         get_time: Optional[Callable[[], float]] = None,
+        control_policy: Optional[ControlPolicy] = None,
         _environ: Optional[Mapping[str, str]] = None,
     ):
         # Copy of os.environ allows us to replace it for testing
@@ -721,6 +725,7 @@ class Console:
         self.safe_box = safe_box
         self.get_datetime = get_datetime or datetime.now
         self.get_time = get_time or monotonic
+        self.control_policy = control_policy
         self.style = style
         self.no_color = (
             no_color
@@ -1610,12 +1615,19 @@ class Console:
     def control(self, *control: Control) -> None:
         """Insert non-printing control codes.
 
+        Control codes are subject to this console's ``control_policy`` (if any);
+        a policy in ``"reject"`` mode raises before anything is written.
+
         Args:
             control_codes (str): Control codes, such as those that may move the cursor.
         """
         if not self.is_dumb_terminal:
+            segments = [_control.segment for _control in control]
+            if self.control_policy is not None:
+                # Fail here (before buffering) if the policy rejects a code.
+                segments = self._apply_control_policy(segments)
             with self:
-                self._buffer.extend(_control.segment for _control in control)
+                self._buffer.extend(segments)
 
     def out(
         self,
@@ -2041,6 +2053,32 @@ class Console:
         os.dup2(devnull, sys.stdout.fileno())
         raise SystemExit(1)
 
+    def _apply_control_policy(self, segments: Iterable[Segment]) -> List[Segment]:
+        """Apply this console's control policy to a sequence of segments.
+
+        The same decision is used for both the written output and the record
+        buffer, so recording always matches what would be written. Plain text
+        segments are never reinterpreted as control codes.
+
+        Args:
+            segments (Iterable[Segment]): Segments about to be written.
+
+        Returns:
+            List[Segment]: The segments that may be written.
+
+        Raises:
+            errors.ControlSequenceRejected: If the policy rejects a control
+                sequence (nothing is written in that case).
+        """
+        policy = self.control_policy
+        if policy is None:
+            return list(segments)
+        new_segments: List[Segment] = []
+        extend = new_segments.extend
+        for segment in segments:
+            extend(policy.apply(segment))
+        return new_segments
+
     def _check_buffer(self) -> None:
         """Check if the buffer may be rendered. Render it if it can (e.g. Console.quiet is False)
         Rendering is supported on Windows, Unix and Jupyter environments. For
@@ -2050,6 +2088,15 @@ class Console:
         if self.quiet:
             del self._buffer[:]
             return
+
+        if self.control_policy is not None:
+            try:
+                self._buffer[:] = self._apply_control_policy(self._buffer)
+            except errors.ControlSequenceRejected:
+                # Fail before anything is written, leaving no partial
+                # control sequence in the buffer, the file, or the record.
+                del self._buffer[:]
+                raise
 
         try:
             self._write_buffer()

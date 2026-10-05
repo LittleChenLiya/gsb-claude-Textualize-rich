@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Added `ControlPolicy` and the `control_policy` parameter to `Console`, allowing callers to explicitly authorize which `ControlType` sequences a console may emit. Non-authorized control codes are either replaced with a visible diagnostic (`on_disallowed="diagnose"`) or raise `errors.ControlSequenceRejected` before anything is written (`on_disallowed="reject"`). The policy applies per-console and governs both written output and recording.
+
 ## [15.0.0] - 2026-04-12
 
 ### Changed
