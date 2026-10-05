@@ -35,6 +35,10 @@ if TYPE_CHECKING:
     )
 
 
+_LAYOUT_MEASURE_WIDTH = 1 << 20
+"""Effectively unbounded width used to measure natural cell content widths."""
+
+
 @dataclass
 class Column:
     """Defines a column within a ~Table.
@@ -150,6 +154,114 @@ class _Cell(NamedTuple):
     """Cell vertical alignment."""
 
 
+@dataclass
+class ColumnLayout:
+    """Layout information for a single column, recorded while rendering a table.
+
+    All widths are in terminal cells and include cell padding (but not borders).
+    """
+
+    index: int
+    """Index of the column within the table."""
+
+    minimum: int
+    """Measured minimum width of the column (including padding)."""
+
+    maximum: int
+    """Measured maximum (natural content) width of the column (including padding)."""
+
+    width: int
+    """Final width allocated to the column (including padding)."""
+
+    reasons: List[str] = field(default_factory=list)
+    """Human readable reasons for any wrapping or ellipsis applied to cells."""
+
+    @property
+    def wrapped(self) -> bool:
+        """Check if any cell content in the column was wrapped."""
+        return any("wrapped" in reason for reason in self.reasons)
+
+    @property
+    def truncated(self) -> bool:
+        """Check if any cell content in the column was truncated (ellipsis/crop)."""
+        return any("overflow" in reason for reason in self.reasons)
+
+
+@dataclass
+class TableLayoutReport:
+    """A report describing how a :class:`~rich.table.Table` was laid out.
+
+    The report is generated from the measurements and segments produced by the
+    regular render pass, so enabling it does not cause cell renderables to be
+    rendered or measured an additional time. It stores widths and reasons only,
+    never cell text.
+    """
+
+    columns: List[ColumnLayout]
+    """Per-column layout information."""
+
+    max_width: int
+    """Width available to the table when it was rendered."""
+
+    table_width: int
+    """Total width of the rendered table, including padding and borders."""
+
+    content_width: int
+    """Sum of the final column widths (includes padding, excludes borders)."""
+
+    padding_width: int
+    """Total horizontal cell padding included in the column widths."""
+
+    border_width: int
+    """Width occupied by box edges and column dividers."""
+
+    def __str__(self) -> str:
+        lines = [
+            f"TableLayoutReport(max_width={self.max_width}, "
+            f"table_width={self.table_width}, "
+            f"content_width={self.content_width}, "
+            f"padding_width={self.padding_width}, "
+            f"border_width={self.border_width})"
+        ]
+        for column in self.columns:
+            lines.append(
+                f"  column {column.index}: min={column.minimum} "
+                f"max={column.maximum} width={column.width}"
+            )
+            for reason in column.reasons:
+                lines.append(f"    - {reason}")
+        return "\n".join(lines)
+
+    def __rich_console__(
+        self, console: "Console", options: "ConsoleOptions"
+    ) -> "RenderResult":
+        table = Table(
+            title="Table layout report",
+            box=box.SIMPLE_HEAD,
+            show_edge=False,
+            pad_edge=False,
+        )
+        table.add_column("Column", justify="right")
+        table.add_column("Min", justify="right")
+        table.add_column("Max", justify="right")
+        table.add_column("Width", justify="right")
+        table.add_column("Reasons")
+        for column in self.columns:
+            table.add_row(
+                str(column.index),
+                str(column.minimum),
+                str(column.maximum),
+                str(column.width),
+                "\n".join(column.reasons),
+            )
+        table.caption = (
+            f"max_width={self.max_width} content={self.content_width} "
+            f"padding={self.padding_width} border={self.border_width} "
+            f"total={self.table_width}"
+        )
+        yield from console.render(table, options)
+
+
 class Table(JupyterMixin):
     """A console renderable to draw a table.
 
@@ -180,6 +292,11 @@ class Table(JupyterMixin):
         title_justify (str, optional): Justify method for title. Defaults to "center".
         caption_justify (str, optional): Justify method for caption. Defaults to "center".
         highlight (bool, optional): Highlight cell contents (if str). Defaults to False.
+        layout_report (bool, optional): Record a layout report while rendering. After the
+            table has been rendered, a :class:`TableLayoutReport` is available as the
+            ``layout_report`` attribute. The report is built from the regular render
+            pass, so cell renderables are not rendered or measured any extra times.
+            Defaults to False.
     """
 
     columns: List[Column]
@@ -213,6 +330,7 @@ class Table(JupyterMixin):
         title_justify: "JustifyMethod" = "center",
         caption_justify: "JustifyMethod" = "center",
         highlight: bool = False,
+        layout_report: bool = False,
     ) -> None:
         self.columns: List[Column] = []
         self.rows: List[Row] = []
@@ -240,6 +358,12 @@ class Table(JupyterMixin):
         self.title_justify: "JustifyMethod" = title_justify
         self.caption_justify: "JustifyMethod" = caption_justify
         self.highlight = highlight
+        self._layout_report_enabled = layout_report
+        self.layout_report: Optional[TableLayoutReport] = None
+        self._layout_record: Optional[List[List[int]]] = None
+        self._layout_cell_widths: List[List[int]] = []
+        self._layout_ranges: List[Tuple[int, int]] = []
+        self._layout_reasons: List[List[str]] = []
         self.row_styles: Sequence[StyleType] = list(row_styles or [])
         append_column = self.columns.append
         for header in headers:
@@ -490,6 +614,9 @@ class Table(JupyterMixin):
         )
         table_width = sum(widths) + extra_width
 
+        if self._layout_report_enabled:
+            self._layout_reasons = [[] for _ in self.columns]
+
         render_options = options.update(
             width=table_width, highlight=self.highlight, height=None
         )
@@ -519,6 +646,80 @@ class Table(JupyterMixin):
                 style=Style.pick_first(self.caption_style, "table.caption"),
                 justify=self.caption_justify,
             )
+        if self._layout_report_enabled:
+            self.layout_report = self._make_layout_report(
+                widths, max_width, extra_width
+            )
+
+    def _make_layout_report(
+        self, widths: List[int], max_width: int, extra_width: int
+    ) -> TableLayoutReport:
+        """Build a layout report from data recorded during the render pass.
+
+        Args:
+            widths (List[int]): Final column widths (including padding).
+            max_width (int): Width available to the table.
+            extra_width (int): Width occupied by borders and dividers.
+
+        Returns:
+            TableLayoutReport: A report describing the layout of the table.
+        """
+        available_width = max_width - extra_width
+        columns_layout: List[ColumnLayout] = []
+        for index, (column, width) in enumerate(zip(self.columns, widths)):
+            minimum, maximum = (
+                self._layout_ranges[index]
+                if index < len(self._layout_ranges)
+                else (width, width)
+            )
+            cell_widths = (
+                self._layout_cell_widths[index]
+                if index < len(self._layout_cell_widths)
+                else []
+            )
+            if cell_widths:
+                # The recorded cell content widths are not clamped to the
+                # available width, so they give the true natural maximum.
+                maximum = max(maximum, max(cell_widths))
+            reasons: List[str] = []
+            if width < minimum:
+                reasons.append(
+                    f"final width {width} is below measured minimum {minimum}; "
+                    f"available width {available_width} was too small"
+                )
+            elif width < maximum:
+                reasons.append(
+                    f"reduced from content width {maximum} to fit "
+                    f"available width {available_width}"
+                )
+            elif width > maximum:
+                reasons.append(
+                    f"expanded from content width {maximum} to fill "
+                    f"available width {available_width}"
+                )
+            else:
+                reasons.append("content fits without wrapping")
+            if index < len(self._layout_reasons):
+                reasons.extend(self._layout_reasons[index])
+            columns_layout.append(
+                ColumnLayout(
+                    index=index,
+                    minimum=minimum,
+                    maximum=maximum,
+                    width=width,
+                    reasons=reasons,
+                )
+            )
+        return TableLayoutReport(
+            columns=columns_layout,
+            max_width=max_width,
+            table_width=sum(widths) + extra_width,
+            content_width=sum(widths),
+            padding_width=sum(
+                self._get_padding_width(column._index) for column in self.columns
+            ),
+            border_width=extra_width,
+        )
 
     def _calculate_column_widths(
         self, console: "Console", options: "ConsoleOptions"
@@ -526,9 +727,20 @@ class Table(JupyterMixin):
         """Calculate the widths of each column, including padding, not including borders."""
         max_width = options.max_width
         columns = self.columns
+        if self._layout_report_enabled:
+            # Record per-cell content widths during the first (and normally only)
+            # measurement pass, so the layout report doesn't require any
+            # additional measuring of cell renderables.
+            self._layout_record = [[] for _ in columns]
         width_ranges = [
             self._measure_column(console, options, column) for column in columns
         ]
+        if self._layout_record is not None:
+            self._layout_cell_widths = self._layout_record
+            self._layout_record = None
+            self._layout_ranges = [
+                (_range.minimum, _range.maximum) for _range in width_ranges
+            ]
         widths = [_range.maximum or 1 for _range in width_ranges]
 
         get_padding_width = self._get_padding_width
@@ -737,10 +949,26 @@ class Table(JupyterMixin):
         append_min = min_widths.append
         append_max = max_widths.append
         get_render_width = Measurement.get
+        layout_record = self._layout_record
+        record_cell_widths = (
+            layout_record[column._index]
+            if layout_record is not None and column._index < len(layout_record)
+            else None
+        )
+        if record_cell_widths is not None:
+            # Measure with an effectively unbounded width so that the recorded
+            # per-cell content widths are not clamped to the available width.
+            # The column measurement is clamped below exactly as before, so
+            # the resulting layout is identical to a regular render.
+            measure_options = options.update_width(_LAYOUT_MEASURE_WIDTH)
+        else:
+            measure_options = options
         for cell in self._get_cells(console, column._index, column):
-            _min, _max = get_render_width(console, options, cell.renderable)
+            _min, _max = get_render_width(console, measure_options, cell.renderable)
             append_min(_min)
             append_max(_max)
+            if record_cell_widths is not None:
+                record_cell_widths.append(_max)
 
         measurement = Measurement(
             max(min_widths) if min_widths else 1,
@@ -826,7 +1054,12 @@ class Table(JupyterMixin):
                 row_style = get_style(
                     get_row_style(console, index - 1 if show_header else index)
                 )
-            for width, cell, column in zip(widths, row_cell, columns):
+            record_layout = self._layout_report_enabled
+            layout_reasons = self._layout_reasons
+            layout_cell_widths = self._layout_cell_widths
+            for column_index, (width, cell, column) in enumerate(
+                zip(widths, row_cell, columns)
+            ):
                 render_options = options.update(
                     width=width,
                     justify=column.justify,
@@ -840,6 +1073,29 @@ class Table(JupyterMixin):
                     render_options,
                     style=get_style(cell.style) + row_style,
                 )
+                if record_layout and column_index < len(layout_reasons):
+                    # Explain any wrapping or ellipsis using the widths recorded
+                    # during measurement; no cell text is stored in the report.
+                    column_cell_widths = (
+                        layout_cell_widths[column_index]
+                        if column_index < len(layout_cell_widths)
+                        else []
+                    )
+                    if index < len(column_cell_widths):
+                        cell_width = column_cell_widths[index]
+                        if cell_width > width:
+                            if not column.no_wrap and len(lines) > 1:
+                                layout_reasons[column_index].append(
+                                    f"cell content width {cell_width} exceeds final "
+                                    f"width {width}; wrapped into {len(lines)} lines"
+                                )
+                            else:
+                                no_wrap_note = " (no_wrap)" if column.no_wrap else ""
+                                layout_reasons[column_index].append(
+                                    f"cell content width {cell_width} exceeds final "
+                                    f"width {width}; overflow={column.overflow!r} "
+                                    f"applied{no_wrap_note}"
+                                )
                 max_height = max(max_height, len(lines))
                 cells.append(lines)
 

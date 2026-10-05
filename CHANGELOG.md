@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Added optional `layout_report` to `Table`. When enabled, rendering records a `TableLayoutReport` (available as `Table.layout_report`) listing each column's minimum, maximum and final width (padding and borders included), plus the actual reasons for any wrapping or ellipsis. The report is built from the regular render pass, so cell renderables are not measured or rendered any extra times, and no cell text is stored.
+
 ## [15.0.0] - 2026-04-12
 
 ### Changed
